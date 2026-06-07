@@ -35,7 +35,7 @@ powershell -ExecutionPolicy Bypass -File .\Invoke-PCTuneup.ps1
 | 3 | **Integrity repair** — `DISM /RestoreHealth` → `sfc /scannow` | This order matters: SFC repairs *from* the component store, so the store is fixed first. Needs internet. |
 | 4 | **Filesystem** — `chkdsk C: /scan` | Online, non-destructive. Full `/f /r` only under `-DeepClean`. |
 | 5 | **Optimize** — `Optimize-Volume` per fixed drive | Media-aware: TRIM on SSD, defrag on HDD. |
-| 6 | **Cleanup** — temp dirs + `DISM /StartComponentCleanup` | Skipped with `-SkipCleanup`. Direct deletion (deterministic), not `cleanmgr`. Reports GB reclaimed on `C:`. |
+| 6 | **Cleanup** — temp (>24h old) + `DISM /StartComponentCleanup` | Skipped with `-SkipCleanup`. Deletes temp items older than 24h and preserves the live session's in-use files (incl. CIM module proxies). Reports GB reclaimed on `C:`. |
 | 7 | **Defender** — signatures + QuickScan | Skipped if a third-party AV owns protection. |
 | — | **Reports** (always) | Disk health, DNS servers, critical/error event sweep (7d), **app crash-loop detection**, startup audit, power/battery, **pending-reboot status**. |
 

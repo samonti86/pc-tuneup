@@ -303,7 +303,10 @@ function Update-Apps {
 function Repair-CrashLoops {
     Write-Section "1b. Targeted repair of crash-looping apps (winget)"
     # Opt-in. Consumes the detection done by Find-CrashLoops (runs at startup).
-    if (-not $RepairCrashLoops) { Add-Result 'Crash-loop repair' 'Skipped' 'not requested (-RepairCrashLoops)'; return }
+    if (-not $RepairCrashLoops) {
+        Write-Host "  Skipped -- opt-in. Re-run with -RepairCrashLoops to act on detected crash loops." -ForegroundColor DarkGray
+        Add-Result 'Crash-loop repair' 'Skipped' 'not requested (-RepairCrashLoops)'; return
+    }
     if (-not $script:CrashLoops -or $script:CrashLoops.Count -eq 0) {
         Add-Result 'Crash-loop repair' 'Skipped' 'no crash loops detected'; return
     }
@@ -418,15 +421,22 @@ function Clear-TempFiles {
     # Snapshot free space so we can report what cleanup actually reclaimed.
     $beforeGB = Get-FreeSpaceGB 'C'
 
-    # Direct deletion is deterministic and non-interactive. (cleanmgr /verylowdisk
-    # is NOT reliably silent -- it can still demand an OK click.) In-use files are
-    # locked and skipped automatically; -EA SilentlyContinue swallows those.
-    foreach ($path in @("$env:TEMP\*", "$env:WINDIR\Temp\*")) {
-        if (Confirm-Action "remove $path") {
-            Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue
+    # Delete only temp items NOT touched in the last 24h, and never the CDXML/CIM
+    # module proxies PowerShell drops here (remoteIpMoProxy_*). Why: this script runs
+    # inside a live PS session that uses $env:TEMP itself -- deleting a proxy that a
+    # module first-loads LATER breaks that module (we hit exactly this: wiping TEMP in
+    # this step broke Clear-DnsClientCache in the DNS report). "Locked files are
+    # skipped" was the wrong assumption -- these aren't locked, just needed later.
+    # Recent = possibly in use; old temp is the reclaimable junk anyway.
+    $cutoff = (Get-Date).AddDays(-1)
+    foreach ($root in @($env:TEMP, (Join-Path $env:WINDIR 'Temp'))) {
+        if (Confirm-Action "remove items older than 24h in $root") {
+            Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTime -lt $cutoff -and $_.Name -notlike 'remoteIpMoProxy_*' } |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
-    Add-Result 'Temp cleanup' ($(if ($DryRun) {'DryRun'} else {'OK'}))
+    Add-Result 'Temp cleanup' ($(if ($DryRun) {'DryRun'} else {'OK'}) ) '>24h old; CIM proxies preserved'
 
     # Trim superseded WinSxS components. /ResetBase (under -DeepClean) also drops the
     # ability to uninstall current updates AND is ignored on recent builds -- opt-in only.
@@ -663,13 +673,24 @@ function Get-NetworkReport {
     # (benign) WRITE, so honor the contracts: skip it under -ReportOnly and let
     # Confirm-Action suppress it under -DryRun. Otherwise -DryRun would mutate
     # state, breaking the "-DryRun changes nothing" guarantee.
+    # try/catch (not -EA SilentlyContinue): the DnsClient module is CDXML-backed, so a
+    # broken/missing proxy is a MODULE-LOAD failure that surfaces before the cmdlet's
+    # ErrorAction applies. Catch it so the report degrades gracefully either way.
     if (-not $ReportOnly -and (Confirm-Action "flush DNS client cache")) {
-        Clear-DnsClientCache -ErrorAction SilentlyContinue
-        Write-Host "  DNS client cache flushed." -ForegroundColor Green
+        try {
+            Clear-DnsClientCache -ErrorAction Stop
+            Write-Host "  DNS client cache flushed." -ForegroundColor Green
+        } catch {
+            Write-Host "  DNS flush unavailable: $(($_.Exception.Message -split "`r?`n")[0])" -ForegroundColor DarkGray
+        }
     }
-    Get-DnsClientServerAddress -AddressFamily IPv4 |
-        Where-Object { $_.ServerAddresses } |
-        Select-Object InterfaceAlias, ServerAddresses | Format-Table -AutoSize
+    try {
+        Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction Stop |
+            Where-Object { $_.ServerAddresses } |
+            Select-Object InterfaceAlias, ServerAddresses | Format-Table -AutoSize
+    } catch {
+        Write-Host "  DNS server list unavailable: $(($_.Exception.Message -split "`r?`n")[0])" -ForegroundColor DarkGray
+    }
     Add-Result 'DNS report' 'OK'
 }
 

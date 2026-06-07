@@ -66,7 +66,13 @@ Origin research (the verified command spec this script implements) lives in
       winget repair/upgrade, skip-if-ambiguous). Filters on the 'Application Error'
       PROVIDER, not just Event ID 1000 (podman et al. reuse that ID). Decodes exception
       codes. Found ExpressVPN.BrowserHelper.exe crash-looping 355x/7d, 0xE0434352/.NET (2026-06-07)
-- [ ] Real ELEVATED end-to-end run on this Win11 box (will pop UAC; needs user present)
+- [x] First real ELEVATED end-to-end run (2026-06-07): restore point, DISM/SFC clean,
+      chkdsk clean, TRIM, 2.21 GB reclaimed, PSWindowsUpdate installed a driver. Surfaced
+      a bug -> fixed: temp cleanup wiped $env:TEMP wholesale, deleting the live session's
+      CDXML/CIM module proxies, which broke Clear-DnsClientCache (first-loaded post-cleanup).
+      Fix: delete only >24h-old temp + preserve remoteIpMoProxy_*; harden DNS report with
+      try/catch (module-LOAD errors bypass -EA SilentlyContinue). Validated under 5.1 (2026-06-07)
+- [ ] Re-run elevated end-to-end to confirm the DNS step is now clean
 - [ ] User action: fix ExpressVPN BrowserHelper crash loop (update/reinstall ExpressVPN
       or disable its browser integration) -- app bug, not OS corruption
 - [ ] Test on a Windows 10 machine to confirm cross-version behavior
