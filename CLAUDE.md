@@ -72,7 +72,18 @@ Origin research (the verified command spec this script implements) lives in
       CDXML/CIM module proxies, which broke Clear-DnsClientCache (first-loaded post-cleanup).
       Fix: delete only >24h-old temp + preserve remoteIpMoProxy_*; harden DNS report with
       try/catch (module-LOAD errors bypass -EA SilentlyContinue). Validated under 5.1 (2026-06-07)
-- [ ] Re-run elevated end-to-end to confirm the DNS step is now clean
+- [x] 2nd elevated run (under pwsh 7.6) post-mortem: Defender + DNS silently no-op'd and
+      were MISREPORTED (Defender "Skipped/3rd-party AV?", DNS false "OK"). Root cause: the
+      ORIGINAL pre-fix wholesale $env:TEMP wipe poisoned PowerShell's persisted
+      module-analysis cache (it referenced a deleted remoteIpMoProxy_*..._94a5a24c proxy);
+      that stale state carried into the next run, so CDXML modules (DnsClient, ConfigDefender)
+      failed to autoload mid-run. Machine has since SELF-HEALED (fresh PS7/5.1 sessions load
+      both fine). Fixes: (1) Invoke-Defender now CALLS Get-MpComputerStatus and distinguishes
+      absent (Skipped) vs load-error (Failed) -- never a silent skip; (2) Get-NetworkReport
+      explicitly Import-Module DnsClient first so a load failure is caught on a command we own
+      and reported as Skipped, not false OK. Verified under 5.1 AND 7.6 (2026-06-07)
+- [ ] Re-run elevated end-to-end to confirm Defender SCAN + DNS flush now actually EXECUTE
+      (not just report honestly) -- expected clean now that cache self-healed + proxies preserved
 - [ ] User action: fix ExpressVPN BrowserHelper crash loop (update/reinstall ExpressVPN
       or disable its browser integration) -- app bug, not OS corruption
 - [ ] Test on a Windows 10 machine to confirm cross-version behavior

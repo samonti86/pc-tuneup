@@ -484,10 +484,22 @@ function Reset-NetworkStack {
 
 function Invoke-Defender {
     Write-Section "9. Microsoft Defender (signatures + scan)"
-    # Defender cmdlets fail / go passive when a 3rd-party AV owns protection.
-    if (-not (Test-CommandExists 'Get-MpComputerStatus')) {
-        Add-Result 'Defender' 'Skipped' 'Defender cmdlets unavailable'
-        Write-Warning "Defender module not available (third-party AV?) -- skipping."
+    # Probe by actually CALLING the status cmdlet so we can tell three states apart:
+    #   - cmdlet genuinely absent (3rd-party AV / N/A)  -> Skipped
+    #   - present but the module fails to LOAD            -> Failed (NOT a silent skip!)
+    #   - available                                       -> proceed
+    # The old code used Test-CommandExists, which returns $false on a module-LOAD
+    # error too -- so a transient CDXML/proxy fault got misreported as "third-party
+    # AV?" and the scan was silently skipped. Never again: a load error is a failure.
+    try {
+        $null = Get-MpComputerStatus -ErrorAction Stop
+    } catch [System.Management.Automation.CommandNotFoundException] {
+        Add-Result 'Defender' 'Skipped' 'cmdlets not present (3rd-party AV / N/A)'
+        Write-Warning "Defender cmdlets not present -- skipping (third-party AV or feature absent)."
+        return
+    } catch {
+        Add-Result 'Defender' 'Failed' "status check failed: $(($_.Exception.Message -split "`r?`n")[0])"
+        Write-Warning "Defender is present but its status check FAILED -- scan NOT run. $(($_.Exception.Message -split "`r?`n")[0])"
         return
     }
     if (-not (Confirm-Action "update signatures + $($(if($FullScan){'Full'}else{'Quick'}))Scan")) {
@@ -669,29 +681,37 @@ function Get-PendingRebootReport {
 
 function Get-NetworkReport {
     Write-Section "Report: DNS servers + cache flush"
-    # The server-address listing is read-only and always runs. The flush is a
-    # (benign) WRITE, so honor the contracts: skip it under -ReportOnly and let
-    # Confirm-Action suppress it under -DryRun. Otherwise -DryRun would mutate
-    # state, breaking the "-DryRun changes nothing" guarantee.
-    # try/catch (not -EA SilentlyContinue): the DnsClient module is CDXML-backed, so a
-    # broken/missing proxy is a MODULE-LOAD failure that surfaces before the cmdlet's
-    # ErrorAction applies. Catch it so the report degrades gracefully either way.
-    if (-not $ReportOnly -and (Confirm-Action "flush DNS client cache")) {
-        try {
-            Clear-DnsClientCache -ErrorAction Stop
-            Write-Host "  DNS client cache flushed." -ForegroundColor Green
-        } catch {
-            Write-Host "  DNS flush unavailable: $(($_.Exception.Message -split "`r?`n")[0])" -ForegroundColor DarkGray
-        }
-    }
+    # DnsClient is a CDXML module, so a broken/missing CIM proxy is a MODULE-LOAD
+    # failure that surfaces during command AUTO-LOAD -- before the cmdlet's own
+    # ErrorAction (and, as we saw on a real run, even leaking past a try/catch around
+    # the cmdlet call). So load the module EXPLICITLY first: the failure then happens
+    # on Import-Module, a command we own, which our catch handles cleanly. If it can't
+    # load, we report Skipped honestly instead of a false 'OK'.
+    $dnsReady = $true
     try {
-        Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction Stop |
+        Import-Module DnsClient -ErrorAction Stop
+    } catch {
+        $dnsReady = $false
+        Write-Host "  DnsClient module failed to load -- skipping DNS flush + listing this run." -ForegroundColor Yellow
+        Write-Host "    $(($_.Exception.Message -split "`r?`n")[0])" -ForegroundColor DarkGray
+    }
+
+    if ($dnsReady) {
+        # The flush is a (benign) WRITE: skip under -ReportOnly and let Confirm-Action
+        # suppress it under -DryRun, so -DryRun still changes nothing.
+        if (-not $ReportOnly -and (Confirm-Action "flush DNS client cache")) {
+            try {
+                Clear-DnsClientCache -ErrorAction Stop
+                Write-Host "  DNS client cache flushed." -ForegroundColor Green
+            } catch {
+                Write-Host "  DNS flush failed: $(($_.Exception.Message -split "`r?`n")[0])" -ForegroundColor DarkGray
+            }
+        }
+        Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
             Where-Object { $_.ServerAddresses } |
             Select-Object InterfaceAlias, ServerAddresses | Format-Table -AutoSize
-    } catch {
-        Write-Host "  DNS server list unavailable: $(($_.Exception.Message -split "`r?`n")[0])" -ForegroundColor DarkGray
     }
-    Add-Result 'DNS report' 'OK'
+    Add-Result 'DNS report' $(if ($dnsReady) { 'OK' } else { 'Skipped' }) $(if ($dnsReady) { '' } else { 'DnsClient load failed' })
 }
 
 # ===========================================================================
