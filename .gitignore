@@ -1,0 +1,7 @@
+# Runtime output — generated per run, not source
+pc-tuneup-logs/
+*.log
+
+# powercfg reports the script drops in the user profile (if ever run from repo root)
+energy-report.html
+battery-report.html
