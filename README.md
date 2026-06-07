@@ -29,14 +29,15 @@ powershell -ExecutionPolicy Bypass -File .\Invoke-PCTuneup.ps1
 
 | # | Step | Notes |
 |---|------|-------|
+| 0 | **System Restore checkpoint** — `Checkpoint-Computer` | Seatbelt before anything changes. Skipped with a warning if System Restore is disabled; Windows also throttles to one point per 24h. |
 | 1 | **App updates** — `winget upgrade --all` | Skipped with a warning if winget isn't installed. Non-interactive flags applied. |
 | 2 | **Windows Update** | Fully scripted if the optional `PSWindowsUpdate` module is present; otherwise triggers detection and points you to Settings. |
 | 3 | **Integrity repair** — `DISM /RestoreHealth` → `sfc /scannow` | This order matters: SFC repairs *from* the component store, so the store is fixed first. Needs internet. |
 | 4 | **Filesystem** — `chkdsk C: /scan` | Online, non-destructive. Full `/f /r` only under `-DeepClean`. |
 | 5 | **Optimize** — `Optimize-Volume` per fixed drive | Media-aware: TRIM on SSD, defrag on HDD. |
-| 6 | **Cleanup** — temp dirs + `DISM /StartComponentCleanup` | Skipped with `-SkipCleanup`. Direct deletion (deterministic), not `cleanmgr`. |
+| 6 | **Cleanup** — temp dirs + `DISM /StartComponentCleanup` | Skipped with `-SkipCleanup`. Direct deletion (deterministic), not `cleanmgr`. Reports GB reclaimed on `C:`. |
 | 7 | **Defender** — signatures + QuickScan | Skipped if a third-party AV owns protection. |
-| — | **Reports** (always) | Disk health, DNS flush, critical/error event sweep (7d), startup audit, power/battery. |
+| — | **Reports** (always) | Disk health, DNS servers, critical/error event sweep (7d), startup audit, power/battery, **pending-reboot status**. |
 
 The highest-leverage steps are **app updates** and the **event sweep** — that's where
 incidents actually get prevented. Cleanup is just hygiene.

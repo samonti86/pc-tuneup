@@ -129,6 +129,16 @@ function Test-CommandExists {
     return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
+# Free space (GB) on a drive, or $null if it can't be read. Used to report how
+# much cleanup actually reclaimed.
+function Get-FreeSpaceGB {
+    param([string]$Drive = 'C')
+    try {
+        $d = Get-PSDrive -Name $Drive -ErrorAction Stop
+        return [math]::Round($d.Free / 1GB, 2)
+    } catch { return $null }
+}
+
 # Gate any action behind -DryRun. Returns $true if the caller should proceed.
 function Confirm-Action {
     param([string]$What)
@@ -165,6 +175,36 @@ function Invoke-Native {
 # ===========================================================================
 # ACTION STEPS  (skipped entirely when -ReportOnly)
 # ===========================================================================
+
+function New-RestoreCheckpoint {
+    Write-Section "0. System Restore checkpoint"
+    # Seatbelt: a rollback point that PRE-DATES every change below (app updates,
+    # DISM/SFC, registry-touching cleanup). Conceptually like a ZFS/LVM snapshot
+    # before a risky operation -- if something regresses, you roll back.
+    #
+    # Two real-world gotchas we tolerate rather than fail on:
+    #   1. System Restore is OFF by default on many OEM/clean images. Checkpoint-
+    #      Computer then throws -- we catch and tell the user how to enable it.
+    #   2. Windows rate-limits restore points to one per 24h (governed by
+    #      SystemRestorePointCreationFrequency). A second call inside that window
+    #      is silently a no-op -- acceptable; the existing point still protects us.
+    if (-not (Test-CommandExists 'Checkpoint-Computer')) {
+        Add-Result 'Restore point' 'Skipped' 'Checkpoint-Computer unavailable'
+        Write-Warning "Checkpoint-Computer not available -- skipping restore point."
+        return
+    }
+    if (-not (Confirm-Action "create a System Restore checkpoint")) { Add-Result 'Restore point' 'DryRun'; return }
+    try {
+        Checkpoint-Computer -Description "pc-tuneup $(Get-Date -Format 'yyyy-MM-dd HH:mm')" `
+            -RestorePointType 'MODIFY_SETTINGS' -ErrorAction Stop
+        Add-Result 'Restore point' 'OK'
+        Write-Host "  Restore point created." -ForegroundColor Green
+    } catch {
+        Add-Result 'Restore point' 'Skipped' $_.Exception.Message
+        Write-Warning "Could not create restore point: $($_.Exception.Message)"
+        Write-Host "  (Enable once with: Enable-ComputerRestore -Drive 'C:\')" -ForegroundColor DarkGray
+    }
+}
 
 function Update-Apps {
     Write-Section "1. Third-party app updates (winget)"
@@ -254,6 +294,9 @@ function Clear-TempFiles {
     Write-Section "6. Cleanup (temp + WinSxS component store)"
     if ($SkipCleanup) { Add-Result 'Cleanup' 'Skipped' '-SkipCleanup'; return }
 
+    # Snapshot free space so we can report what cleanup actually reclaimed.
+    $beforeGB = Get-FreeSpaceGB 'C'
+
     # Direct deletion is deterministic and non-interactive. (cleanmgr /verylowdisk
     # is NOT reliably silent -- it can still demand an OK click.) In-use files are
     # locked and skipped automatically; -EA SilentlyContinue swallows those.
@@ -272,6 +315,14 @@ function Clear-TempFiles {
         Write-Host "  -DeepClean: adding /ResetBase (blocks uninstalling current updates)." -ForegroundColor Yellow
     }
     Invoke-Native 'WinSxS component cleanup' 'DISM.exe' $dismArgs
+
+    # Report reclaimed space (real runs only -- under -DryRun nothing was deleted).
+    $afterGB = Get-FreeSpaceGB 'C'
+    if (-not $DryRun -and $null -ne $beforeGB -and $null -ne $afterGB) {
+        $reclaimed = [math]::Round($afterGB - $beforeGB, 2)
+        Write-Host ("  C: free space  {0} GB -> {1} GB  (reclaimed {2} GB)" -f $beforeGB, $afterGB, $reclaimed) -ForegroundColor Green
+        Add-Result 'Space reclaimed' 'OK' ("{0} GB (C: {1}->{2} GB)" -f $reclaimed, $beforeGB, $afterGB)
+    }
 }
 
 function Clear-UpdateCache {
@@ -395,14 +446,53 @@ function Get-PowerReport {
     }
 }
 
+function Get-PendingRebootReport {
+    Write-Section "Report: Pending reboot"
+    # Windows doesn't expose a single "reboot pending" flag -- it leaves markers in
+    # several registry locations. Any one present => a reboot is owed. This matters
+    # here because chkdsk /f /r, DISM, and -NetworkReset all DEFER work to next boot;
+    # this is the one place that tells the user the run isn't truly finished.
+    $pending = @()
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') {
+        $pending += 'Component-Based Servicing (DISM/SFC/updates)'
+    }
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') {
+        $pending += 'Windows Update'
+    }
+    $pfro = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' `
+                -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
+    if ($pfro) { $pending += 'Pending file-rename (locked files, incl. chkdsk /f /r)' }
+    # Pending computer rename: active name differs from the staged next-boot name.
+    $active = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' `
+                  -Name ComputerName -ErrorAction SilentlyContinue).ComputerName
+    $next   = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' `
+                  -Name ComputerName -ErrorAction SilentlyContinue).ComputerName
+    if ($active -and $next -and $active -ne $next) { $pending += 'Pending computer rename' }
+
+    if ($pending.Count -gt 0) {
+        Write-Host "  REBOOT PENDING -- restart to finish:" -ForegroundColor Yellow
+        $pending | ForEach-Object { Write-Host "    - $_" -ForegroundColor Yellow }
+        Add-Result 'Pending reboot' 'OK' ('YES: ' + ($pending -join '; '))
+    } else {
+        Write-Host "  No reboot pending." -ForegroundColor Green
+        Add-Result 'Pending reboot' 'OK' 'none'
+    }
+}
+
 function Get-NetworkReport {
-    Write-Section "Report: DNS cache flush"
-    Clear-DnsClientCache -ErrorAction SilentlyContinue
-    Write-Host "  DNS client cache flushed." -ForegroundColor Green
+    Write-Section "Report: DNS servers + cache flush"
+    # The server-address listing is read-only and always runs. The flush is a
+    # (benign) WRITE, so honor the contracts: skip it under -ReportOnly and let
+    # Confirm-Action suppress it under -DryRun. Otherwise -DryRun would mutate
+    # state, breaking the "-DryRun changes nothing" guarantee.
+    if (-not $ReportOnly -and (Confirm-Action "flush DNS client cache")) {
+        Clear-DnsClientCache -ErrorAction SilentlyContinue
+        Write-Host "  DNS client cache flushed." -ForegroundColor Green
+    }
     Get-DnsClientServerAddress -AddressFamily IPv4 |
         Where-Object { $_.ServerAddresses } |
         Select-Object InterfaceAlias, ServerAddresses | Format-Table -AutoSize
-    Add-Result 'DNS flush + report' 'OK'
+    Add-Result 'DNS report' 'OK'
 }
 
 # ===========================================================================
@@ -415,6 +505,7 @@ Write-Host "Log: $logFile" -ForegroundColor DarkGray
 
 try {
     if (-not $ReportOnly) {
+        New-RestoreCheckpoint
         Update-Apps
         Invoke-OSUpdate
         Repair-SystemIntegrity
@@ -432,6 +523,7 @@ try {
     Get-EventSummary
     Get-StartupAudit
     Get-PowerReport
+    Get-PendingRebootReport
 
     # ----- Summary -----
     Write-Section "Summary"

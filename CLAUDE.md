@@ -56,7 +56,12 @@ Origin research (the verified command spec this script implements) lives in
 - [x] Verified command spec written (in command-center, 2026-06-07)
 - [x] Full script built: self-elevation, transcript, all guards, report, param surface (2026-06-07)
 - [x] Static parse clean; Get-WinEvent + winget claims smoke-tested (2026-06-07)
-- [ ] Real end-to-end run on this Win11 box (will pop UAC; needs user present)
+- [x] Build-out: System Restore checkpoint (step 0), free-space-reclaimed reporting,
+      pending-reboot report; fixed -DryRun violation (DNS flush now gated) (2026-06-07)
+- [x] Integration smoke test under real Windows PowerShell 5.1 (26100): AST-loaded the
+      shipped function bodies, ran all read-only reports + DryRun gating on this box.
+      DryRun contract verified; pending-reboot correctly caught a live file-rename marker (2026-06-07)
+- [ ] Real ELEVATED end-to-end run on this Win11 box (will pop UAC; needs user present)
 - [ ] Test on a Windows 10 machine to confirm cross-version behavior
-- [ ] Optional: publish to GitHub + add to command-center projects-index
+- [ ] Optional: add to command-center projects-index
 - [ ] Optional: scheduled-task wrapper for monthly auto-run
