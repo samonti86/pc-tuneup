@@ -44,6 +44,12 @@
     netsh winsock reset + netsh int ip reset. REQUIRES A REBOOT and can disrupt
     VPN/proxy config. Use only when the socket layer is corrupted.
 
+.PARAMETER RepairCrashLoops
+    For each app the crash-loop report flags (>=10 native crashes in 7 days), attempt
+    a TARGETED winget repair (falling back to upgrade) of just that package. Opt-in:
+    skips any app it can't confidently map to a single winget package. Detection of
+    crash loops is always-on and read-only; only the repair action is gated by this.
+
 .EXAMPLE
     .\Invoke-PCTuneup.ps1
     Run the safe monthly routine (self-elevates).
@@ -65,7 +71,8 @@ param(
     [switch]$FullScan,
     [switch]$DeepClean,
     [switch]$FlushUpdateCache,
-    [switch]$NetworkReset
+    [switch]$NetworkReset,
+    [switch]$RepairCrashLoops
 )
 
 # ---------------------------------------------------------------------------
@@ -149,6 +156,76 @@ function Confirm-Action {
     return $true
 }
 
+# Decode the common Win32/CLR exception codes a crash reports, so the report says
+# WHY something died rather than just printing a raw hex code.
+function Convert-ExceptionCode {
+    param($Code)
+    if ($null -eq $Code -or "$Code" -eq '') { return 'n/a' }
+    $norm = ("$Code" -replace '^0x', '').ToUpper().Trim()
+    $map = @{
+        'E0434352' = '.NET/CLR exception'
+        'C0000005' = 'access violation'
+        'C0000409' = 'stack buffer overrun'
+        'C00000FD' = 'stack overflow'
+        'C0000374' = 'heap corruption'
+        'C0000017' = 'out of memory'
+        '80000003' = 'breakpoint'
+    }
+    if ($map.ContainsKey($norm)) { return "0x$norm ($($map[$norm]))" }
+    return "0x$norm"
+}
+
+# Parse `winget list` text output by header-column offsets and return the single Id
+# if exactly one package matched. Returns $null on zero/ambiguous/locale-mismatch --
+# the caller treats $null as "don't touch anything" (safe by default).
+function Get-WingetIdFromListing {
+    param([string]$Raw)
+    if (-not $Raw) { return $null }
+    $lines  = $Raw -split "\r?\n" | Where-Object { $_ -and ($_ -notmatch '^[\s\-\\|/]+$') }
+    $header = $lines | Where-Object { $_ -match '(^|\s)Id(\s|$)' -and $_ -match 'Version' } | Select-Object -First 1
+    if (-not $header) { return $null }
+    $idCol  = $header.IndexOf('Id')
+    $verCol = $header.IndexOf('Version')
+    if ($idCol -lt 0 -or $verCol -le $idCol) { return $null }
+    $hIdx = [array]::IndexOf($lines, $header)
+    if ($hIdx -lt 0 -or ($hIdx + 1) -ge $lines.Count) { return $null }
+    $ids = foreach ($d in $lines[($hIdx + 1)..($lines.Count - 1)]) {
+        if ($d.Length -gt $idCol) {
+            $end = [Math]::Min($verCol, $d.Length)
+            $field = $d.Substring($idCol, $end - $idCol).Trim()
+            if ($field) { $field }
+        }
+    }
+    $ids = @($ids | Where-Object { $_ } | Sort-Object -Unique)
+    if ($ids.Count -eq 1) { return $ids[0] }
+    return $null
+}
+
+# Map a faulting executable to its installed winget package Id. Prefers the
+# structured Microsoft.WinGet.Client module (clean objects, locale-proof); falls
+# back to parsing the winget CLI. Returns $null unless the match is unambiguous.
+function Resolve-WingetId {
+    param([string]$App, [string]$Path)
+    $term = $null
+    if ($Path -and (Test-Path $Path -ErrorAction SilentlyContinue)) {
+        try { $term = (Get-Item $Path -ErrorAction Stop).VersionInfo.ProductName } catch { }
+    }
+    if (-not $term) { $term = [System.IO.Path]::GetFileNameWithoutExtension($App) }
+    if (-not $term) { return $null }
+
+    if (Test-CommandExists 'Get-WinGetPackage') {
+        try {
+            $ids = @(Get-WinGetPackage -ErrorAction Stop |
+                Where-Object { $_.Name -like "*$term*" -or $_.Id -like "*$term*" } |
+                ForEach-Object { $_.Id } | Sort-Object -Unique)
+            if ($ids.Count -eq 1) { return $ids[0] }
+            return $null
+        } catch { }
+    }
+    $out = (winget list --name $term --accept-source-agreements 2>$null | Out-String)
+    return (Get-WingetIdFromListing -Raw $out)
+}
+
 # Run a native EXE and judge success by $LASTEXITCODE (these tools don't throw).
 function Invoke-Native {
     param(
@@ -221,6 +298,50 @@ function Update-Apps {
         --accept-source-agreements --accept-package-agreements `
         --silent --disable-interactivity
     Add-Result 'App updates (winget)' 'OK'
+}
+
+function Repair-CrashLoops {
+    Write-Section "1b. Targeted repair of crash-looping apps (winget)"
+    # Opt-in. Consumes the detection done by Find-CrashLoops (runs at startup).
+    if (-not $RepairCrashLoops) { Add-Result 'Crash-loop repair' 'Skipped' 'not requested (-RepairCrashLoops)'; return }
+    if (-not $script:CrashLoops -or $script:CrashLoops.Count -eq 0) {
+        Add-Result 'Crash-loop repair' 'Skipped' 'no crash loops detected'; return
+    }
+    if (-not (Test-CommandExists 'winget')) {
+        Add-Result 'Crash-loop repair' 'Skipped' 'winget unavailable'
+        Write-Warning "winget not available -- cannot auto-repair. See the crash-loop report for manual steps."
+        return
+    }
+    foreach ($c in $script:CrashLoops) {
+        $id = Resolve-WingetId -App $c.App -Path $c.Path
+        if (-not $id) {
+            Write-Host "  '$($c.App)': no confident winget match -- skipping (repair/reinstall it manually)." -ForegroundColor Yellow
+            Add-Result "Repair $($c.App)" 'Skipped' 'no confident winget match'
+            continue
+        }
+        if (-not (Confirm-Action "winget repair --id $id  (fallback: upgrade)")) {
+            Add-Result "Repair $($c.App)" 'DryRun' $id; continue
+        }
+        # 'repair' re-runs the installer's repair path; if the package doesn't
+        # support it (non-zero exit), fall back to pulling the latest version,
+        # which is the next-safest fix for an app-level bug.
+        Write-Host "  Repairing $($c.App) -> winget package '$id'..." -ForegroundColor Cyan
+        winget repair --id $id --silent --accept-source-agreements --disable-interactivity
+        $code = $LASTEXITCODE
+        if ($code -ne 0) {
+            Write-Host "  repair unavailable/failed (exit $code); trying 'winget upgrade'..." -ForegroundColor DarkGray
+            winget upgrade --id $id --include-unknown `
+                --accept-source-agreements --accept-package-agreements `
+                --silent --disable-interactivity
+            $code = $LASTEXITCODE
+        }
+        if ($code -eq 0) {
+            Add-Result "Repair $($c.App)" 'OK' $id
+        } else {
+            Add-Result "Repair $($c.App)" 'Failed' "$id (exit $code)"
+            Write-Warning "Repair of '$id' returned exit $code -- repair it manually."
+        }
+    }
 }
 
 function Invoke-OSUpdate {
@@ -423,6 +544,63 @@ function Get-EventSummary {
     }
 }
 
+function Find-CrashLoops {
+    # READ-ONLY detection. Populates $script:CrashLoops with one entry per faulting
+    # executable that crashed >= $threshold times in the last 7 days. Split from the
+    # rendering (Get-CrashLoopReport) and the repair (Repair-CrashLoops) so all three
+    # share one scan and the repair step can run *before* the report block.
+    $threshold = 10
+    $since = (Get-Date).AddDays(-7)
+    $script:CrashLoops = @()
+
+    # Filter on the 'Application Error' PROVIDER, not just Event ID 1000 -- other
+    # providers (e.g. podman) reuse ID 1000 and would otherwise pollute the count.
+    $crashes = Get-WinEvent -FilterHashtable @{
+        LogName      = 'Application'
+        ProviderName = 'Application Error'
+        Id           = 1000
+        StartTime    = $since
+    } -ErrorAction SilentlyContinue
+    if (-not $crashes) { return }
+
+    $byApp = $crashes | Group-Object { $_.Properties[0].Value } | Where-Object { $_.Count -ge $threshold }
+    foreach ($g in $byApp) {
+        # Application Error (1000) property layout: [0]=app [3]=module [6]=exception
+        # code [10]=full app path. Bounds-check in case a malformed event is short.
+        $s = $g.Group | Select-Object -First 1
+        $sorted = $g.Group | Sort-Object TimeCreated
+        $script:CrashLoops += [pscustomobject]@{
+            App           = $g.Name
+            Path          = $(if ($s.Properties.Count -gt 10) { $s.Properties[10].Value } else { '' })
+            Count         = $g.Count
+            Module        = $(if ($s.Properties.Count -gt 3)  { $s.Properties[3].Value }  else { '' })
+            ExceptionCode = $(if ($s.Properties.Count -gt 6)  { $s.Properties[6].Value }  else { '' })
+            FirstSeen     = ($sorted | Select-Object -First 1).TimeCreated
+            LastSeen      = ($sorted | Select-Object -Last 1).TimeCreated
+        }
+    }
+}
+
+function Get-CrashLoopReport {
+    Write-Section "Report: Application crash loops (last 7 days)"
+    if (-not $script:CrashLoops -or $script:CrashLoops.Count -eq 0) {
+        Write-Host "  No app exceeded the crash-loop threshold (>=10 in 7d). Clean." -ForegroundColor Green
+        Add-Result 'Crash-loop scan' 'OK' '0 crash loops'
+        return
+    }
+    foreach ($c in $script:CrashLoops) {
+        $exc = Convert-ExceptionCode $c.ExceptionCode
+        Write-Host ("  {0}  --  {1} crashes" -f $c.App, $c.Count) -ForegroundColor Yellow
+        Write-Host ("     module: {0}   exception: {1}" -f $c.Module, $exc) -ForegroundColor DarkGray
+        Write-Host ("     first: {0}   last: {1}" -f $c.FirstSeen, $c.LastSeen) -ForegroundColor DarkGray
+        if ($c.Path) { Write-Host ("     path: {0}" -f $c.Path) -ForegroundColor DarkGray }
+        Add-Result "Crash loop: $($c.App)" 'OK' ("{0} crashes; {1}" -f $c.Count, $exc)
+    }
+    if (-not $RepairCrashLoops) {
+        Write-Host "  Tip: re-run with -RepairCrashLoops for a targeted winget repair/upgrade of these." -ForegroundColor DarkGray
+    }
+}
+
 function Get-StartupAudit {
     Write-Section "Report: Startup programs"
     # Get-CimInstance, not the deprecated Get-WmiObject (removed in PS7).
@@ -504,9 +682,14 @@ Write-Host "PC Tuneup -- $(if($DryRun){'[DRY RUN] '})$(if($ReportOnly){'[REPORT 
 Write-Host "Log: $logFile" -ForegroundColor DarkGray
 
 try {
+    # Detect crash loops up front (read-only) so the opt-in repair step below can
+    # act on the same scan the report renders later.
+    Find-CrashLoops
+
     if (-not $ReportOnly) {
         New-RestoreCheckpoint
         Update-Apps
+        Repair-CrashLoops
         Invoke-OSUpdate
         Repair-SystemIntegrity
         Invoke-ChkdskScan
@@ -521,6 +704,7 @@ try {
     Get-DiskHealthReport
     Get-NetworkReport
     Get-EventSummary
+    Get-CrashLoopReport
     Get-StartupAudit
     Get-PowerReport
     Get-PendingRebootReport

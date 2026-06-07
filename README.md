@@ -37,7 +37,7 @@ powershell -ExecutionPolicy Bypass -File .\Invoke-PCTuneup.ps1
 | 5 | **Optimize** — `Optimize-Volume` per fixed drive | Media-aware: TRIM on SSD, defrag on HDD. |
 | 6 | **Cleanup** — temp dirs + `DISM /StartComponentCleanup` | Skipped with `-SkipCleanup`. Direct deletion (deterministic), not `cleanmgr`. Reports GB reclaimed on `C:`. |
 | 7 | **Defender** — signatures + QuickScan | Skipped if a third-party AV owns protection. |
-| — | **Reports** (always) | Disk health, DNS servers, critical/error event sweep (7d), startup audit, power/battery, **pending-reboot status**. |
+| — | **Reports** (always) | Disk health, DNS servers, critical/error event sweep (7d), **app crash-loop detection**, startup audit, power/battery, **pending-reboot status**. |
 
 The highest-leverage steps are **app updates** and the **event sweep** — that's where
 incidents actually get prevented. Cleanup is just hygiene.
@@ -53,6 +53,22 @@ incidents actually get prevented. Cleanup is just hygiene.
 | `-DeepClean` | **Opt-in.** Adds `chkdsk /f /r` (reboot-time) and DISM `/ResetBase`. `/ResetBase` blocks uninstalling current updates. |
 | `-FlushUpdateCache` | **Opt-in.** Stop wuauserv/bits, wipe `SoftwareDistribution\Download`, restart. Use when Windows Update is stuck. |
 | `-NetworkReset` | **Opt-in.** `netsh winsock reset` + `netsh int ip reset`. **Requires reboot**, may disrupt VPN/proxy. |
+| `-RepairCrashLoops` | **Opt-in.** For each app flagged as crash-looping, run a targeted `winget repair` (→ `upgrade` fallback) of *only* that package. Skips any app it can't map to a single winget package. |
+
+## Crash-loop detection & repair
+
+The event sweep tells you *how many* app errors there were; the **crash-loop report**
+tells you *which app* and *why*. It reads genuine Windows Error Reporting crashes
+(provider `Application Error`, Event ID 1000 — not other providers that reuse that ID),
+groups by faulting executable, and flags any app with **≥10 native crashes in 7 days**,
+decoding the exception code (e.g. `0xE0434352` → a .NET/CLR exception).
+
+Detection is always-on and read-only. Remediation is **opt-in** via `-RepairCrashLoops`,
+which is deliberately conservative: it only ever runs `winget repair`/`upgrade` against a
+package it can map the faulting binary to *unambiguously* — otherwise it skips and tells
+you to repair that app by hand. It never kills processes, uninstalls, or edits the
+registry. The safest generic fix for an app bug is "ship the current version," which is
+exactly what `winget` does.
 
 ## Output & logging
 

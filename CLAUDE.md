@@ -62,7 +62,13 @@ Origin research (the verified command spec this script implements) lives in
       shipped function bodies, ran all read-only reports + DryRun gating on this box.
       DryRun contract verified; pending-reboot correctly caught a live file-rename marker (2026-06-07)
 - [x] Published to GitHub (private): github.com/samonti86/pc-tuneup; origin/master tracked (2026-06-07)
+- [x] Crash-loop detection (always-on, read-only) + opt-in -RepairCrashLoops (targeted
+      winget repair/upgrade, skip-if-ambiguous). Filters on the 'Application Error'
+      PROVIDER, not just Event ID 1000 (podman et al. reuse that ID). Decodes exception
+      codes. Found ExpressVPN.BrowserHelper.exe crash-looping 355x/7d, 0xE0434352/.NET (2026-06-07)
 - [ ] Real ELEVATED end-to-end run on this Win11 box (will pop UAC; needs user present)
+- [ ] User action: fix ExpressVPN BrowserHelper crash loop (update/reinstall ExpressVPN
+      or disable its browser integration) -- app bug, not OS corruption
 - [ ] Test on a Windows 10 machine to confirm cross-version behavior
 - [ ] Optional: add to command-center projects-index
 - [ ] Optional: scheduled-task wrapper for monthly auto-run
