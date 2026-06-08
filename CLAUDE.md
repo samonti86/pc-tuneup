@@ -118,6 +118,16 @@ Origin research (the verified command spec this script implements) lives in
       EXCLUDED registry cleaners / auto driver updates / service-debloat (unsafe snake-oil).
       Added PSAvoidUsingComputerNameHardcoded to PSSA exclusions (1.1.1.1 probe is intentional).
       Verified on live box + parse + PSSA-clean under 5.1 AND 7.6 (2026-06-08)
+- [x] Two bug fixes from a -DeepClean -NetworkReset run (2026-06-08): (1) 'netsh int ip reset'
+      returns exit 1 + "Access is denied" on ONE ACL-locked NSI registry key (HKLM\...\Nsi\...)
+      that Windows blocks even for elevated admin/SYSTEM -- the rest of the stack still resets.
+      Reset-NetworkStack now captures the output and reports Partial (benign) when it ran but
+      only ACL-locked keys were denied, instead of a hard Failure. Deliberately do NOT take key
+      ownership (risky ACL surgery, no benefit). (2) powercfg /output path was wrapped in manual
+      quotes ("`"$path`""), so the native exe saw a leading '"', treated the absolute path as
+      RELATIVE, and prepended the cwd -- mislocating the energy/battery report. Fixed by passing
+      the bare path (PS auto-quotes native args with spaces). Parse + PSSA-clean; netsh classifier
+      verified against the real log output (2026-06-08)
 - [ ] User action: fix ExpressVPN (BrowserHelper crashes 336x/7d + its 3 services crash 28x);
       reinstall/update or remove -- it dominates both event logs. winget now maps it
       (XP9M14XF781P6R), so '-RepairIssues' can attempt it; or remove ExpressVPN outright

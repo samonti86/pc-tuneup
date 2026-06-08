@@ -546,7 +546,30 @@ function Reset-NetworkStack {
     if (-not $NetworkReset) { Add-Result 'Network reset' 'Skipped' 'not requested'; return }
     Write-Host "  WARNING: requires a reboot and may disrupt VPN/proxy config." -ForegroundColor Red
     Invoke-Native 'winsock reset' 'netsh.exe' @('winsock','reset')
-    Invoke-Native 'int ip reset'  'netsh.exe' @('int','ip','reset')
+
+    # 'netsh int ip reset' almost always returns exit 1 with "Access is denied" on ONE
+    # key -- an NSI key under HKLM\SYSTEM\CurrentControlSet\Control\Nsi\... that Windows
+    # ACL-locks so even an elevated admin/SYSTEM can't write it. The rest of the TCP/IP
+    # stack still resets. So when it ran but only ACL-locked keys were denied, report
+    # Partial (benign), not a hard Failure. We deliberately do NOT take ownership of that
+    # key -- modifying a system-protected ACL is risky surgery for no real benefit.
+    if (-not (Confirm-Action "int ip reset  (netsh.exe int ip reset)")) {
+        Add-Result 'int ip reset' 'DryRun'; return
+    }
+    Write-Host "  > netsh.exe int ip reset" -ForegroundColor DarkCyan
+    $out  = (& netsh.exe int ip reset 2>&1 | Out-String)
+    $code = $LASTEXITCODE
+    Write-Host $out
+    if ($code -eq 0) {
+        Add-Result 'int ip reset' 'OK' 'exit 0'
+    } elseif ($out -match 'Access is denied' -and $out -match ', OK!') {
+        Add-Result 'int ip reset' 'Partial' 'ran; 1 ACL-locked NSI key denied (known Windows quirk, benign)'
+        Write-Host "  Note: one protected registry key couldn't be reset (Access is denied) -- a known," -ForegroundColor Yellow
+        Write-Host "  harmless Windows ACL quirk. The rest of the TCP/IP stack WAS reset. Reboot to finish." -ForegroundColor Yellow
+    } else {
+        Add-Result 'int ip reset' 'Failed' "exit $code"
+        Write-Warning "int ip reset returned exit code $code"
+    }
 }
 
 function Invoke-Defender {
@@ -968,12 +991,15 @@ function Get-PowerReport {
     Write-Section "Report: Power / battery"
     # /energy works on desktops too; battery/sleepstudy need a battery. Reports land
     # in the log dir (timestamped, retention-pruned) instead of cluttering $USERPROFILE.
+    # Pass the path as a bare argument -- PowerShell auto-quotes native-command args that
+    # contain spaces. Wrapping it in literal quotes makes powercfg see a leading '"',
+    # treat the absolute path as RELATIVE, and prepend the cwd (mangling the output path).
     $energyPath = Join-Path $script:LogDir "energy-report-$($script:RunStamp).html"
-    Invoke-Native 'Power energy report' 'powercfg.exe' @('/energy','/output',"`"$energyPath`"","/duration","20")
+    Invoke-Native 'Power energy report' 'powercfg.exe' @('/energy','/output',$energyPath,'/duration','20')
     if (-not $script:DryRun) { Write-Host "  Energy report: $energyPath" -ForegroundColor DarkGray }
     if (Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue) {
         $battPath = Join-Path $script:LogDir "battery-report-$($script:RunStamp).html"
-        Invoke-Native 'Battery report' 'powercfg.exe' @('/batteryreport','/output',"`"$battPath`"")
+        Invoke-Native 'Battery report' 'powercfg.exe' @('/batteryreport','/output',$battPath)
         if (-not $script:DryRun) { Write-Host "  Battery report: $battPath" -ForegroundColor DarkGray }
     } else {
         Write-Host "  No battery detected -- skipping battery report (desktop)." -ForegroundColor DarkGray
