@@ -82,8 +82,14 @@ Origin research (the verified command spec this script implements) lives in
       absent (Skipped) vs load-error (Failed) -- never a silent skip; (2) Get-NetworkReport
       explicitly Import-Module DnsClient first so a load failure is caught on a command we own
       and reported as Skipped, not false OK. Verified under 5.1 AND 7.6 (2026-06-07)
-- [ ] Re-run elevated end-to-end to confirm Defender SCAN + DNS flush now actually EXECUTE
-      (not just report honestly) -- expected clean now that cache self-healed + proxies preserved
+- [x] Defender engine-state refinement: this box runs MALWAREBYTES as the primary AV, so
+      Get-MpComputerStatus reports AMServiceEnabled=$false / AMRunningMode='Not running'
+      (Defender stood down -- stronger than passive). On-demand Start-MpScan can't run with
+      a stopped engine, so Invoke-Defender now checks the engine state and reports an accurate
+      'Skipped: engine inactive; another AV is primary' (not a guess, not a Failed). Corrects
+      the earlier wrong expectation that the next run would scan. Verified 5.1+7.6 (2026-06-07)
+- [ ] Re-run elevated end-to-end to confirm DNS flush now EXECUTES (Defender will correctly
+      skip -- Malwarebytes is primary; that's expected, not a bug)
 - [ ] User action: fix ExpressVPN BrowserHelper crash loop (update/reinstall ExpressVPN
       or disable its browser integration) -- app bug, not OS corruption
 - [ ] Test on a Windows 10 machine to confirm cross-version behavior

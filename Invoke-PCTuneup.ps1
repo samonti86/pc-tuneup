@@ -484,24 +484,42 @@ function Reset-NetworkStack {
 
 function Invoke-Defender {
     Write-Section "9. Microsoft Defender (signatures + scan)"
-    # Probe by actually CALLING the status cmdlet so we can tell three states apart:
-    #   - cmdlet genuinely absent (3rd-party AV / N/A)  -> Skipped
-    #   - present but the module fails to LOAD            -> Failed (NOT a silent skip!)
-    #   - available                                       -> proceed
+    # Probe by actually CALLING the status cmdlet so we can tell FOUR states apart:
+    #   - cmdlet genuinely absent              -> Skipped (Defender feature not installed)
+    #   - present but the module fails to LOAD -> Failed  (NOT a silent skip!)
+    #   - present but engine NOT RUNNING       -> Skipped (a 3rd-party AV like
+    #     Malwarebytes is primary; Defender stood down -> nothing to scan with)
+    #   - present and running (Normal/Passive) -> proceed
     # The old code used Test-CommandExists, which returns $false on a module-LOAD
     # error too -- so a transient CDXML/proxy fault got misreported as "third-party
-    # AV?" and the scan was silently skipped. Never again: a load error is a failure.
+    # AV?" and the scan was silently skipped. Never again: a load error is a failure,
+    # and an inactive engine is a clearly-labelled skip (not a guess, not a failure).
     try {
-        $null = Get-MpComputerStatus -ErrorAction Stop
+        $status = Get-MpComputerStatus -ErrorAction Stop
     } catch [System.Management.Automation.CommandNotFoundException] {
-        Add-Result 'Defender' 'Skipped' 'cmdlets not present (3rd-party AV / N/A)'
-        Write-Warning "Defender cmdlets not present -- skipping (third-party AV or feature absent)."
+        Add-Result 'Defender' 'Skipped' 'cmdlets not present (Defender feature absent)'
+        Write-Warning "Defender cmdlets not present -- skipping (feature not installed)."
         return
     } catch {
         Add-Result 'Defender' 'Failed' "status check failed: $(($_.Exception.Message -split "`r?`n")[0])"
         Write-Warning "Defender is present but its status check FAILED -- scan NOT run. $(($_.Exception.Message -split "`r?`n")[0])"
         return
     }
+
+    # On-demand scans need Defender's antimalware engine running. When another AV is
+    # the registered primary (Malwarebytes here), Defender reports AMServiceEnabled=$false
+    # / AMRunningMode='Not running' -- it CAN'T scan, so skip accurately. (Passive mode,
+    # by contrast, still permits Start-MpScan, so only a stopped engine is skipped.)
+    $mode = "$($status.AMRunningMode)"
+    if (-not $status.AMServiceEnabled -or $mode -eq 'Not running') {
+        Add-Result 'Defender' 'Skipped' "engine inactive (mode: $mode); another AV is primary"
+        Write-Host "  Defender engine inactive (AMRunningMode: $mode) -- another AV owns protection. Skipping scan." -ForegroundColor Yellow
+        return
+    }
+    if ($mode -and $mode -ne 'Normal') {
+        Write-Host "  Defender running mode: $mode (a 3rd-party AV may be primary; on-demand scan still supported)." -ForegroundColor DarkGray
+    }
+
     if (-not (Confirm-Action "update signatures + $($(if($FullScan){'Full'}else{'Quick'}))Scan")) {
         Add-Result 'Defender' 'DryRun'; return
     }
