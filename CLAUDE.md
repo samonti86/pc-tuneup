@@ -98,10 +98,21 @@ Origin research (the verified command spec this script implements) lives in
       reclaimed-space labels negative deltas as "net change"; fixed 2 empty catch blocks. Added
       PSScriptAnalyzerSettings.psd1 (3 documented rule exclusions) -> PSSA now CLEAN. Verified
       parse + PSSA-clean + Invoke-Step isolation under 5.1 AND 7.6 (2026-06-07)
-- [ ] Re-run elevated end-to-end to confirm DNS flush now EXECUTES (Defender will correctly
-      skip -- Malwarebytes is primary; that's expected, not a bug)
-- [ ] User action: fix ExpressVPN BrowserHelper crash loop (update/reinstall ExpressVPN
-      or disable its browser integration) -- app bug, not OS corruption
+- [x] Confirmed clean elevated run (tuneup-2026-06-07-202952): DNS flush EXECUTED, Defender
+      correctly Skipped (engine inactive/Malwarebytes), no Failed steps -- both prior fixes
+      validated in production (2026-06-07)
+- [x] Generalized crash-loop -> Event Viewer HEALTH ANALYZER (2026-06-08): one sweep of
+      System+Application (Crit+Error, 7d), classified against a knowledge-base of ~15 issue
+      types (disk/WHEA/shutdown=High; app+service crashes/VSS/WU=Medium; DCOM/TPM/cert/Hyper-V
+      =Low) with severity + named culprits + SAFE recommendation each. Only auto-repair is the
+      winget app-repair (opt-in, now -RepairIssues; alias -RepairCrashLoops); everything else is
+      recommend-only by design (most event issues have no safe generic fix). Replaced
+      Get-EventSummary+Find-CrashLoops+Get-CrashLoopReport with Get-IssueKnowledgeBase/
+      Resolve-IssueRule/Find-EventIssues/Get-HealthReport. Repair dedupes by winget id. Verified
+      against live logs + parse + PSSA-clean under 5.1 AND 7.6 (2026-06-08)
+- [ ] User action: fix ExpressVPN (BrowserHelper crashes 336x/7d + its 3 services crash 28x);
+      reinstall/update or remove -- it dominates both event logs. winget now maps it
+      (XP9M14XF781P6R), so '-RepairIssues' can attempt it; or remove ExpressVPN outright
 - [ ] Test on a Windows 10 machine to confirm cross-version behavior
 - [ ] Optional: add to command-center projects-index
 - [ ] Optional: scheduled-task wrapper for monthly auto-run

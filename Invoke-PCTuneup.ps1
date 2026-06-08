@@ -44,11 +44,14 @@
     netsh winsock reset + netsh int ip reset. REQUIRES A REBOOT and can disrupt
     VPN/proxy config. Use only when the socket layer is corrupted.
 
-.PARAMETER RepairCrashLoops
-    For each app the crash-loop report flags (>=10 native crashes in 7 days), attempt
-    a TARGETED winget repair (falling back to upgrade) of just that package. Opt-in:
-    skips any app it can't confidently map to a single winget package. Detection of
-    crash loops is always-on and read-only; only the repair action is gated by this.
+.PARAMETER RepairIssues
+    Attempt the SAFE auto-repairs the health analysis flags. In practice that means a
+    targeted winget repair (falling back to upgrade) of crashing apps it can map to a
+    single package -- the one category with a safe, generic automated fix. Skips
+    anything it can't confidently map. Everything else in the analysis is recommendation
+    only (by design: most event-log issues have no safe automated repair). The Event
+    Viewer analysis itself is always-on and read-only; only the repair is gated by this.
+    (Alias: -RepairCrashLoops, kept for compatibility.)
 
 .EXAMPLE
     .\Invoke-PCTuneup.ps1
@@ -72,7 +75,8 @@ param(
     [switch]$DeepClean,
     [switch]$FlushUpdateCache,
     [switch]$NetworkReset,
-    [switch]$RepairCrashLoops
+    [Alias('RepairCrashLoops')]
+    [switch]$RepairIssues
 )
 
 # ---------------------------------------------------------------------------
@@ -336,49 +340,63 @@ function Update-Apps {
     }
 }
 
-function Repair-CrashLoops {
-    Write-Section "1b. Targeted repair of crash-looping apps (winget)"
-    # Opt-in. Consumes the detection done by Find-CrashLoops (runs at startup).
-    if (-not $RepairCrashLoops) {
-        Write-Host "  Skipped -- opt-in. Re-run with -RepairCrashLoops to act on detected crash loops." -ForegroundColor DarkGray
-        Add-Result 'Crash-loop repair' 'Skipped' 'not requested (-RepairCrashLoops)'; return
+function Repair-Issues {
+    Write-Section "1b. Safe auto-repair of detected issues"
+    # Opt-in. Consumes the analysis done by Find-EventIssues (runs at startup). The ONLY
+    # safe, generic automated repair is the winget app repair, so that's all this does;
+    # every other issue category is recommendation-only (shown in the health report).
+    if (-not $RepairIssues) {
+        Write-Host "  Skipped -- opt-in. Re-run with -RepairIssues to attempt the safe auto-repairs." -ForegroundColor DarkGray
+        Add-Result 'Issue repair' 'Skipped' 'not requested (-RepairIssues)'; return
     }
-    if (-not $script:CrashLoops -or $script:CrashLoops.Count -eq 0) {
-        Add-Result 'Crash-loop repair' 'Skipped' 'no crash loops detected'; return
-    }
-    if (-not (Test-CommandExists 'winget')) {
-        Add-Result 'Crash-loop repair' 'Skipped' 'winget unavailable'
-        Write-Warning "winget not available -- cannot auto-repair. See the crash-loop report for manual steps."
+    $repairable = @($script:Issues | Where-Object { $_.AutoRepair -eq 'winget-app' -and $_.Apps })
+    if (-not $repairable) {
+        Add-Result 'Issue repair' 'Skipped' 'nothing safely auto-repairable'
+        Write-Host "  Nothing safely auto-repairable -- see the health report for recommendations." -ForegroundColor DarkGray
         return
     }
-    foreach ($c in $script:CrashLoops) {
-        $id = Resolve-WingetId -App $c.App -Path $c.Path
-        if (-not $id) {
-            Write-Host "  '$($c.App)': no confident winget match -- skipping (repair/reinstall it manually)." -ForegroundColor Yellow
-            Add-Result "Repair $($c.App)" 'Skipped' 'no confident winget match'
-            continue
-        }
-        if (-not (Confirm-Action "winget repair --id $id  (fallback: upgrade)")) {
-            Add-Result "Repair $($c.App)" 'DryRun' $id; continue
-        }
-        # 'repair' re-runs the installer's repair path; if the package doesn't
-        # support it (non-zero exit), fall back to pulling the latest version,
-        # which is the next-safest fix for an app-level bug.
-        Write-Host "  Repairing $($c.App) -> winget package '$id'..." -ForegroundColor Cyan
-        winget repair --id $id --silent --accept-source-agreements --disable-interactivity
-        $code = $LASTEXITCODE
-        if ($code -ne 0) {
-            Write-Host "  repair unavailable/failed (exit $code); trying 'winget upgrade'..." -ForegroundColor DarkGray
-            winget upgrade --id $id --include-unknown `
-                --accept-source-agreements --accept-package-agreements `
-                --silent --disable-interactivity
+    if (-not (Test-CommandExists 'winget')) {
+        Add-Result 'Issue repair' 'Skipped' 'winget unavailable'
+        Write-Warning "winget not available -- cannot auto-repair. See the health report for manual steps."
+        return
+    }
+    # Several faulting exes can map to one package (e.g. ExpressVPN's helper +
+    # notification service). Repair each package at most once per run.
+    $seen = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($iss in $repairable) {
+        foreach ($app in $iss.Apps) {
+            $id = Resolve-WingetId -App $app.App -Path $app.Path
+            if (-not $id) {
+                Write-Host "  '$($app.App)': no confident winget match -- repair/reinstall it manually." -ForegroundColor Yellow
+                Add-Result "Repair $($app.App)" 'Skipped' 'no confident winget match'
+                continue
+            }
+            if (-not $seen.Add($id)) {
+                Write-Host "  '$($app.App)' -> '$id' already handled this run; skipping duplicate." -ForegroundColor DarkGray
+                continue
+            }
+            if (-not (Confirm-Action "winget repair --id $id  (fallback: upgrade)")) {
+                Add-Result "Repair $($app.App)" 'DryRun' $id; continue
+            }
+            # 'repair' re-runs the installer's repair path; if the package doesn't
+            # support it (non-zero exit), fall back to pulling the latest version,
+            # which is the next-safest fix for an app-level bug.
+            Write-Host "  Repairing $($app.App) -> winget package '$id'..." -ForegroundColor Cyan
+            winget repair --id $id --silent --accept-source-agreements --disable-interactivity
             $code = $LASTEXITCODE
-        }
-        if ($code -eq 0) {
-            Add-Result "Repair $($c.App)" 'OK' $id
-        } else {
-            Add-Result "Repair $($c.App)" 'Failed' "$id (exit $code)"
-            Write-Warning "Repair of '$id' returned exit $code -- repair it manually."
+            if ($code -ne 0) {
+                Write-Host "  repair unavailable/failed (exit $code); trying 'winget upgrade'..." -ForegroundColor DarkGray
+                winget upgrade --id $id --include-unknown `
+                    --accept-source-agreements --accept-package-agreements `
+                    --silent --disable-interactivity
+                $code = $LASTEXITCODE
+            }
+            if ($code -eq 0) {
+                Add-Result "Repair $($app.App)" 'OK' $id
+            } else {
+                Add-Result "Repair $($app.App)" 'Failed' "$id (exit $code)"
+                Write-Warning "Repair of '$id' returned exit $code -- repair it manually."
+            }
         }
     }
 }
@@ -599,84 +617,165 @@ function Get-DiskHealthReport {
     Add-Result 'Disk health report' 'OK'
 }
 
-function Get-EventSummary {
-    Write-Section "Report: Critical/Error events (last 7 days)"
-    # -ErrorAction SilentlyContinue is MANDATORY: zero matches is a terminating
-    # error that would otherwise abort the whole script.
-    foreach ($log in @('System','Application')) {
-        $events = Get-WinEvent -FilterHashtable @{
-            LogName   = $log
-            Level     = 1, 2          # 1 = Critical, 2 = Error
-            StartTime = (Get-Date).AddDays(-7)
-        } -ErrorAction SilentlyContinue
-
-        if (-not $events) {
-            Write-Host "  $log : no critical/error events. Clean." -ForegroundColor Green
-            Add-Result "Event sweep ($log)" 'OK' '0 events'
-            continue
-        }
-        Write-Host "  $log : $($events.Count) critical/error events. Top sources:" -ForegroundColor Yellow
-        $events | Group-Object ProviderName |
-            Sort-Object Count -Descending | Select-Object -First 5 Count, Name |
-            Format-Table -AutoSize
-        Add-Result "Event sweep ($log)" 'OK' "$($events.Count) events"
-    }
+# Knowledge base of known event-log issue types. Each rule matches by provider
+# (-like, case-insensitive) and optionally by event Id. Severity decides whether a
+# low-volume issue is still surfaced (High always shows). AutoRepair is 'winget-app'
+# ONLY for application crashes -- the one category with a safe, generic automated fix;
+# everything else is 'none' (we recommend; we don't risk an unsafe auto-change).
+function Get-IssueKnowledgeBase {
+    @(
+        @{ Name = 'App crashes'; Providers = @('Application Error', '.NET Runtime', 'Application Hang'); Severity = 'Medium'; AutoRepair = 'winget-app';
+           Advice = "Update or reinstall the crashing app; if it hooks into a browser or another app, disable that integration. -RepairIssues can attempt a winget repair/upgrade of packages it can map." }
+        @{ Name = 'Service crashes'; Providers = @('Service Control Manager'); Ids = @(7000, 7001, 7009, 7011, 7022, 7023, 7024, 7031, 7034); Severity = 'Medium'; AutoRepair = 'none';
+           Advice = "Windows auto-restarts these. If the service belongs to a third-party app, update/reinstall that app. Persistent crashes of a Windows service warrant SFC/DISM (this routine runs them)." }
+        @{ Name = 'Disk / filesystem'; Providers = @('disk', 'Microsoft-Windows-Ntfs', 'Ntfs', 'volmgr', 'volsnap'); Severity = 'High'; AutoRepair = 'none';
+           Advice = "BACK UP NOW, then run a full chkdsk (-DeepClean schedules chkdsk /f /r at reboot). Check the wear + reliability counters above and the drive cabling -- recurring disk errors can precede drive failure." }
+        @{ Name = 'Hardware (WHEA)'; Providers = @('Microsoft-Windows-WHEA-Logger'); Severity = 'High'; AutoRepair = 'none';
+           Advice = "Hardware-level faults (CPU/PCIe/RAM/bus). Run vendor diagnostics + a memory test (mdsched.exe), update BIOS/chipset/GPU drivers, reseat components. Not software-repairable." }
+        @{ Name = 'Unexpected shutdown'; Providers = @('Microsoft-Windows-Kernel-Power', 'Microsoft-Windows-Kernel-Boot'); Severity = 'High'; AutoRepair = 'none';
+           Advice = "The PC lost power or crashed without a clean shutdown. Check overheating, the PSU/battery, and recently-updated drivers; disabling Fast Startup can help if it recurs. Reliability Monitor shows the timeline." }
+        @{ Name = 'Unexpected shutdown'; Providers = @('EventLog'); Ids = @(6008); Severity = 'High'; AutoRepair = 'none';
+           Advice = "The previous shutdown was unexpected (power loss or a crash). Check overheating, the PSU/battery, and recently-updated drivers; review Reliability Monitor." }
+        @{ Name = 'Backup / shadow copy'; Providers = @('VSS', 'Microsoft-Windows-Backup'); Severity = 'Medium'; AutoRepair = 'none';
+           Advice = "Volume Shadow Copy errors can break backups AND System Restore. Many are transient (raised during shutdown). If persistent, run 'vssadmin list writers' (look for failed writers) and free disk for shadow storage." }
+        @{ Name = 'Windows Update'; Providers = @('Microsoft-Windows-WindowsUpdateClient'); Severity = 'Medium'; AutoRepair = 'none';
+           Advice = "Update failures are often transient and retry automatically. If one is stuck, run with -FlushUpdateCache. Store/UWP errors (e.g. 0x80073D02 = packages in use) usually clear after a reboot or 'wsreset'." }
+        @{ Name = 'Windows Search'; Providers = @('Microsoft-Windows-Search'); Severity = 'Low'; AutoRepair = 'none';
+           Advice = "Rebuild the search index: Settings > Privacy & security > Searching Windows > Advanced indexing options > Rebuild. Safe but I/O-heavy, so left manual." }
+        @{ Name = 'DCOM (usually benign)'; Providers = @('Microsoft-Windows-DistributedCOM'); Severity = 'Low'; AutoRepair = 'none';
+           Advice = "DCOM 10010/10016 timeout/permission entries are extremely common and almost always harmless. Only chase if tied to a concrete symptom; editing DCOM permissions is risky, so no auto-fix." }
+        @{ Name = 'TPM (usually benign)'; Providers = @('Microsoft-Windows-TPM-WMI'); Severity = 'Low'; AutoRepair = 'none';
+           Advice = "Usually benign. If BitLocker or Windows Hello misbehave, inspect tpm.msc; only clear/re-own the TPM deliberately (it can invalidate BitLocker keys)." }
+        @{ Name = 'Certificate enrollment'; Providers = @('Microsoft-Windows-CertificateServicesClient*'); Severity = 'Low'; AutoRepair = 'none';
+           Advice = "Typically benign on a non-domain PC -- only relevant with enterprise/AD certificate services. Safe to ignore otherwise." }
+        @{ Name = 'Hyper-V / WSL networking'; Providers = @('Microsoft-Windows-Hyper-V-*', 'vmms'); Severity = 'Low'; AutoRepair = 'none';
+           Advice = "Usually WSL2/containers (podman)/VM virtual-switch churn. 'wsl --shutdown' or disabling/re-enabling the vEthernet adapter often clears it; generally transient." }
+        @{ Name = 'TCP/IP'; Providers = @('Tcpip', 'Microsoft-Windows-Tcpip'); Severity = 'Low'; AutoRepair = 'none';
+           Advice = "Duplicate-IP or adapter-disconnect warnings. Check for IP conflicts (DHCP reservations) and update the NIC driver; -NetworkReset is a last resort (needs a reboot, can disrupt VPN/proxy)." }
+        @{ Name = 'DNS client'; Providers = @('Microsoft-Windows-DNS-Client'); Severity = 'Low'; AutoRepair = 'none';
+           Advice = "Name-resolution timeouts. The routine already flushes the DNS cache; verify the DNS servers listed above are reachable." }
+    )
 }
 
-function Find-CrashLoops {
-    # READ-ONLY detection. Populates $script:CrashLoops with one entry per faulting
-    # executable that crashed >= $threshold times in the last 7 days. Split from the
-    # rendering (Get-CrashLoopReport) and the repair (Repair-CrashLoops) so all three
-    # share one scan and the repair step can run *before* the report block.
-    $threshold = 10
+# Find the first knowledge-base rule matching a provider (+ optional id constraint).
+function Resolve-IssueRule {
+    param([string]$Provider, [int[]]$Ids)
+    foreach ($rule in Get-IssueKnowledgeBase) {
+        $hit = $false
+        foreach ($p in $rule.Providers) { if ($Provider -like $p) { $hit = $true; break } }
+        if (-not $hit) { continue }
+        if ($rule.ContainsKey('Ids') -and $rule.Ids) {
+            $idHit = $false
+            foreach ($i in $Ids) { if ($rule.Ids -contains $i) { $idHit = $true; break } }
+            if (-not $idHit) { continue }
+        }
+        return $rule
+    }
+    return $null
+}
+
+function Find-EventIssues {
+    # READ-ONLY. ONE sweep of System + Application (Critical+Error, 7d). Groups by
+    # source, classifies each against the knowledge base, merges by category, and
+    # populates $script:Issues. High-severity issues surface even at low counts; lower
+    # ones need volume ($noiseFloor) first. Also records raw per-log totals for the header.
     $since = (Get-Date).AddDays(-7)
-    $script:CrashLoops = @()
+    $noiseFloor = 5
+    $script:Issues = @()
+    $script:EventTotals = [ordered]@{}
 
-    # Filter on the 'Application Error' PROVIDER, not just Event ID 1000 -- other
-    # providers (e.g. podman) reuse ID 1000 and would otherwise pollute the count.
-    $crashes = Get-WinEvent -FilterHashtable @{
-        LogName      = 'Application'
-        ProviderName = 'Application Error'
-        Id           = 1000
-        StartTime    = $since
-    } -ErrorAction SilentlyContinue
-    if (-not $crashes) { return }
-
-    $byApp = $crashes | Group-Object { $_.Properties[0].Value } | Where-Object { $_.Count -ge $threshold }
-    foreach ($g in $byApp) {
-        # Application Error (1000) property layout: [0]=app [3]=module [6]=exception
-        # code [10]=full app path. Bounds-check in case a malformed event is short.
-        $s = $g.Group | Select-Object -First 1
-        $sorted = $g.Group | Sort-Object TimeCreated
-        $script:CrashLoops += [pscustomobject]@{
-            App           = $g.Name
-            Path          = $(if ($s.Properties.Count -gt 10) { $s.Properties[10].Value } else { '' })
-            Count         = $g.Count
-            Module        = $(if ($s.Properties.Count -gt 3)  { $s.Properties[3].Value }  else { '' })
-            ExceptionCode = $(if ($s.Properties.Count -gt 6)  { $s.Properties[6].Value }  else { '' })
-            FirstSeen     = ($sorted | Select-Object -First 1).TimeCreated
-            LastSeen      = ($sorted | Select-Object -Last 1).TimeCreated
-        }
+    $all = @()
+    foreach ($logName in 'System', 'Application') {
+        # -EA SilentlyContinue is MANDATORY: a zero-match Get-WinEvent throws.
+        $ev = @(Get-WinEvent -FilterHashtable @{ LogName = $logName; Level = 1, 2; StartTime = $since } -ErrorAction SilentlyContinue)
+        $script:EventTotals[$logName] = $ev.Count
+        $all += $ev
     }
+    if (-not $all) { return }
+
+    # Merge provider groups into categories ('Application Error' + '.NET Runtime' both
+    # fold into 'App crashes', so the report shows one entry, not two).
+    $cats = @{}
+    foreach ($g in ($all | Group-Object ProviderName)) {
+        $ids  = @($g.Group | ForEach-Object { $_.Id } | Sort-Object -Unique)
+        $rule = Resolve-IssueRule -Provider $g.Name -Ids $ids
+        $cat  = if ($rule) { $rule.Name } else { "$($g.Name) (unclassified)" }
+        if (-not $cats.ContainsKey($cat)) {
+            $cats[$cat] = [pscustomobject]@{
+                Category   = $cat
+                Severity   = if ($rule) { $rule.Severity } else { 'Low' }
+                Advice     = if ($rule) { $rule.Advice } else { "Recurring errors from '$($g.Name)'. Look up the Event ID; the usual safe fix is to update the owning app or device driver." }
+                AutoRepair = if ($rule) { $rule.AutoRepair } else { 'none' }
+                Count      = 0
+                Events     = @()
+                Detail     = ''
+                Apps       = @()
+            }
+        }
+        $cats[$cat].Count  += $g.Count
+        $cats[$cat].Events += $g.Group
+    }
+
+    foreach ($entry in $cats.Values) {
+        # Surface High always; otherwise require the noise floor.
+        if ($entry.Severity -ne 'High' -and $entry.Count -lt $noiseFloor) { continue }
+
+        if ($entry.AutoRepair -eq 'winget-app') {
+            # Per-exe crash counts from Application Error (1000) for targeted repair.
+            # Layout: [0]=app [6]=exception code [10]=full app path.
+            $appErr = $entry.Events | Where-Object { $_.Id -eq 1000 -and $_.Properties.Count -gt 0 }
+            $list = foreach ($ag in ($appErr | Group-Object { $_.Properties[0].Value })) {
+                $s = $ag.Group | Select-Object -First 1
+                [pscustomobject]@{
+                    App   = $ag.Name; Count = $ag.Count
+                    Path  = $(if ($s.Properties.Count -gt 10) { $s.Properties[10].Value } else { '' })
+                    Exc   = $(if ($s.Properties.Count -gt 6) { $s.Properties[6].Value } else { '' })
+                }
+            }
+            $entry.Apps = @($list | Sort-Object Count -Descending)
+            if ($entry.Apps) {
+                $entry.Detail = (($entry.Apps | Select-Object -First 5 | ForEach-Object { "{0} x{1}" -f $_.App, $_.Count }) -join ', ')
+                $exc = Convert-ExceptionCode $entry.Apps[0].Exc
+                if ($exc -ne 'n/a') { $entry.Detail += "  [$exc]" }
+            }
+        }
+        elseif ($entry.Category -eq 'Service crashes') {
+            # SCM event property [0] is the service name.
+            $svcs = $entry.Events | Where-Object { $_.Properties.Count -gt 0 } |
+                Group-Object { $_.Properties[0].Value } | Sort-Object Count -Descending
+            $entry.Detail = (($svcs | Select-Object -First 6 | ForEach-Object { "{0} x{1}" -f $_.Name, $_.Count }) -join ', ')
+        }
+        else {
+            $entry.Detail = "event IDs: $(@($entry.Events | ForEach-Object { $_.Id } | Sort-Object -Unique) -join ', ')"
+        }
+        $script:Issues += $entry
+    }
+
+    $rank = @{ High = 0; Medium = 1; Low = 2 }
+    $script:Issues = @($script:Issues | Sort-Object @{ Expression = { $rank[$_.Severity] } }, @{ Expression = 'Count'; Descending = $true })
 }
 
-function Get-CrashLoopReport {
-    Write-Section "Report: Application crash loops (last 7 days)"
-    if (-not $script:CrashLoops -or $script:CrashLoops.Count -eq 0) {
-        Write-Host "  No app exceeded the crash-loop threshold (>=10 in 7d). Clean." -ForegroundColor Green
-        Add-Result 'Crash-loop scan' 'OK' '0 crash loops'
+function Get-HealthReport {
+    Write-Section "Report: System health (Event Viewer analysis, last 7 days)"
+    foreach ($k in $script:EventTotals.Keys) {
+        Write-Host ("  {0,-12}: {1} critical/error events" -f $k, $script:EventTotals[$k]) -ForegroundColor DarkGray
+    }
+    if (-not $script:Issues -or $script:Issues.Count -eq 0) {
+        Write-Host "  No notable issues classified. Clean." -ForegroundColor Green
+        Add-Result 'Health analysis' 'OK' '0 issues'
         return
     }
-    foreach ($c in $script:CrashLoops) {
-        $exc = Convert-ExceptionCode $c.ExceptionCode
-        Write-Host ("  {0}  --  {1} crashes" -f $c.App, $c.Count) -ForegroundColor Yellow
-        Write-Host ("     module: {0}   exception: {1}" -f $c.Module, $exc) -ForegroundColor DarkGray
-        Write-Host ("     first: {0}   last: {1}" -f $c.FirstSeen, $c.LastSeen) -ForegroundColor DarkGray
-        if ($c.Path) { Write-Host ("     path: {0}" -f $c.Path) -ForegroundColor DarkGray }
-        Add-Result "Crash loop: $($c.App)" 'OK' ("{0} crashes; {1}" -f $c.Count, $exc)
-    }
-    if (-not $RepairCrashLoops) {
-        Write-Host "  Tip: re-run with -RepairCrashLoops for a targeted winget repair/upgrade of these." -ForegroundColor DarkGray
+    Write-Host ""
+    $color = @{ High = 'Red'; Medium = 'Yellow'; Low = 'DarkGray' }
+    foreach ($i in $script:Issues) {
+        Write-Host ("  [{0}] {1}  --  {2} event(s)" -f $i.Severity.ToUpper(), $i.Category, $i.Count) -ForegroundColor $color[$i.Severity]
+        if ($i.Detail) { Write-Host "      $($i.Detail)" -ForegroundColor DarkGray }
+        Write-Host "      -> $($i.Advice)" -ForegroundColor Gray
+        if ($i.AutoRepair -eq 'winget-app' -and $i.Apps) {
+            $hint = if ($RepairIssues) { 'auto-repair runs in step 1b' } else { 're-run with -RepairIssues to attempt a safe winget repair' }
+            Write-Host "      [safe auto-repair available -- $hint]" -ForegroundColor DarkCyan
+        }
+        Add-Result "Issue: $($i.Category)" 'OK' ("{0}; {1} events" -f $i.Severity, $i.Count)
     }
 }
 
@@ -785,12 +884,12 @@ try {
     # Detect crash loops up front (read-only) so the opt-in repair step below can
     # act on the same scan the report renders later. Every step runs via Invoke-Step
     # so one unhandled throw can't sink the rest of the run or the summary.
-    Invoke-Step 'Crash-loop detection' { Find-CrashLoops }
+    Invoke-Step 'Event analysis' { Find-EventIssues }
 
     if (-not $ReportOnly) {
         Invoke-Step 'Restore point'      { New-RestoreCheckpoint }
         Invoke-Step 'App updates'        { Update-Apps }
-        Invoke-Step 'Crash-loop repair'  { Repair-CrashLoops }
+        Invoke-Step 'Issue repair'       { Repair-Issues }
         Invoke-Step 'Windows Update'     { Invoke-OSUpdate }
         Invoke-Step 'System integrity'   { Repair-SystemIntegrity }
         Invoke-Step 'Filesystem check'   { Invoke-ChkdskScan }
@@ -804,8 +903,7 @@ try {
     # Read-only reporting always runs.
     Invoke-Step 'Disk health'       { Get-DiskHealthReport }
     Invoke-Step 'DNS report'        { Get-NetworkReport }
-    Invoke-Step 'Event sweep'       { Get-EventSummary }
-    Invoke-Step 'Crash-loop report' { Get-CrashLoopReport }
+    Invoke-Step 'Health report'     { Get-HealthReport }
     Invoke-Step 'Startup audit'     { Get-StartupAudit }
     Invoke-Step 'Power report'      { Get-PowerReport }
     Invoke-Step 'Pending reboot'    { Get-PendingRebootReport }

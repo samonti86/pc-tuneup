@@ -37,10 +37,10 @@ powershell -ExecutionPolicy Bypass -File .\Invoke-PCTuneup.ps1
 | 5 | **Optimize** — `Optimize-Volume` per fixed drive | Media-aware: TRIM on SSD, defrag on HDD. |
 | 6 | **Cleanup** — temp (>24h old) + `DISM /StartComponentCleanup` | Skipped with `-SkipCleanup`. Deletes temp items older than 24h and preserves the live session's in-use files (incl. CIM module proxies). Reports GB reclaimed on `C:`. |
 | 7 | **Defender** — signatures + QuickScan | Skipped if a third-party AV owns protection. |
-| — | **Reports** (always) | Disk health, DNS servers, critical/error event sweep (7d), **app crash-loop detection**, startup audit, power/battery, **pending-reboot status**. |
+| — | **Reports** (always) | Disk health, DNS servers, **Event Viewer health analysis (7d)**, startup audit, power/battery, **pending-reboot status**. |
 
-The highest-leverage steps are **app updates** and the **event sweep** — that's where
-incidents actually get prevented. Cleanup is just hygiene.
+The highest-leverage output is the **Event Viewer health analysis** — that's where
+real incidents surface. Cleanup is just hygiene.
 
 ## Parameters
 
@@ -53,22 +53,28 @@ incidents actually get prevented. Cleanup is just hygiene.
 | `-DeepClean` | **Opt-in.** Adds `chkdsk /f /r` (reboot-time) and DISM `/ResetBase`. `/ResetBase` blocks uninstalling current updates. |
 | `-FlushUpdateCache` | **Opt-in.** Stop wuauserv/bits, wipe `SoftwareDistribution\Download`, restart. Use when Windows Update is stuck. |
 | `-NetworkReset` | **Opt-in.** `netsh winsock reset` + `netsh int ip reset`. **Requires reboot**, may disrupt VPN/proxy. |
-| `-RepairCrashLoops` | **Opt-in.** For each app flagged as crash-looping, run a targeted `winget repair` (→ `upgrade` fallback) of *only* that package. Skips any app it can't map to a single winget package. |
+| `-RepairIssues` | **Opt-in.** Attempt the safe auto-repairs the analysis flags — in practice a targeted `winget repair` (→ `upgrade` fallback) of crashing apps it can map to a single package. Skips what it can't map. (Alias: `-RepairCrashLoops`.) |
 
-## Crash-loop detection & repair
+## Event Viewer health analysis
 
-The event sweep tells you *how many* app errors there were; the **crash-loop report**
-tells you *which app* and *why*. It reads genuine Windows Error Reporting crashes
-(provider `Application Error`, Event ID 1000 — not other providers that reuse that ID),
-groups by faulting executable, and flags any app with **≥10 native crashes in 7 days**,
-decoding the exception code (e.g. `0xE0434352` → a .NET/CLR exception).
+This is the highest-value output. It does **one** sweep of the System + Application
+logs (Critical/Error, last 7 days), then **classifies** each error source against a
+built-in knowledge base instead of just dumping raw counts. Each issue is shown with a
+**severity** (High / Medium / Low), the specific culprits (faulting apps or service
+names), and a **safe recommendation**:
 
-Detection is always-on and read-only. Remediation is **opt-in** via `-RepairCrashLoops`,
-which is deliberately conservative: it only ever runs `winget repair`/`upgrade` against a
-package it can map the faulting binary to *unambiguously* — otherwise it skips and tells
-you to repair that app by hand. It never kills processes, uninstalls, or edits the
-registry. The safest generic fix for an app bug is "ship the current version," which is
-exactly what `winget` does.
+- **High** — surfaced even at low volume: disk/filesystem errors, hardware (WHEA),
+  unexpected shutdowns.
+- **Medium** — app crashes, service crashes, Volume Shadow Copy / backup, Windows Update.
+- **Low** — usually-benign noise (DCOM timeouts, TPM, cert enrollment, Hyper-V/WSL
+  networking) shown only above a volume threshold.
+
+**Repair vs. recommend.** The honest reality is that most Event Viewer issues have *no*
+safe generic automated fix — the remedy is app/driver/hardware-specific. So the analysis
+**recommends** for those, and only **auto-repairs** the one category that *can* be fixed
+safely and generically: a crashing app, via `winget repair`/`upgrade` of a package it can
+map *unambiguously* (opt-in with `-RepairIssues`). It never kills processes, uninstalls,
+restarts services, or edits the registry on a heuristic — that would be the dangerous move.
 
 ## Output & logging
 
