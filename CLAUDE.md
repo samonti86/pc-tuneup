@@ -110,6 +110,14 @@ Origin research (the verified command spec this script implements) lives in
       Get-EventSummary+Find-CrashLoops+Get-CrashLoopReport with Get-IssueKnowledgeBase/
       Resolve-IssueRule/Find-EventIssues/Get-HealthReport. Repair dedupes by winget id. Verified
       against live logs + parse + PSSA-clean under 5.1 AND 7.6 (2026-06-08)
+- [x] Capability expansion (2026-06-08): + Sync-SystemClock (w32tm /resync, step 8 -- drift
+      breaks SSL/auth); + reports Get-DiskSpaceReport (low-space warn), Get-DirtyBitReport
+      (fsutil dirty query -> pending boot chkdsk), Get-ComponentStoreReport (DISM AnalyzeComponent-
+      Store size + cleanup-recommended), Get-ConnectivityReport (gateway/1.1.1.1/DNS via pure
+      .NET, no CDXML dep); + opt-in -EmptyRecycleBin and -ResetStore (wsreset). Deliberately
+      EXCLUDED registry cleaners / auto driver updates / service-debloat (unsafe snake-oil).
+      Added PSAvoidUsingComputerNameHardcoded to PSSA exclusions (1.1.1.1 probe is intentional).
+      Verified on live box + parse + PSSA-clean under 5.1 AND 7.6 (2026-06-08)
 - [ ] User action: fix ExpressVPN (BrowserHelper crashes 336x/7d + its 3 services crash 28x);
       reinstall/update or remove -- it dominates both event logs. winget now maps it
       (XP9M14XF781P6R), so '-RepairIssues' can attempt it; or remove ExpressVPN outright

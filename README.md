@@ -35,9 +35,10 @@ powershell -ExecutionPolicy Bypass -File .\Invoke-PCTuneup.ps1
 | 3 | **Integrity repair** — `DISM /RestoreHealth` → `sfc /scannow` | This order matters: SFC repairs *from* the component store, so the store is fixed first. Needs internet. |
 | 4 | **Filesystem** — `chkdsk C: /scan` | Online, non-destructive. Full `/f /r` only under `-DeepClean`. |
 | 5 | **Optimize** — `Optimize-Volume` per fixed drive | Media-aware: TRIM on SSD, defrag on HDD. |
-| 6 | **Cleanup** — temp (>24h old) + `DISM /StartComponentCleanup` | Skipped with `-SkipCleanup`. Deletes temp items older than 24h and preserves the live session's in-use files (incl. CIM module proxies). Reports GB reclaimed on `C:`. |
-| 7 | **Defender** — signatures + QuickScan | Skipped if a third-party AV owns protection. |
-| — | **Reports** (always) | Disk health, DNS servers, **Event Viewer health analysis (7d)**, startup audit, power/battery, **pending-reboot status**. |
+| 6 | **Cleanup** — temp (>24h old) + `DISM /StartComponentCleanup` | Skipped with `-SkipCleanup`. Deletes temp items older than 24h and preserves the live session's in-use files (incl. CIM module proxies). Reports GB reclaimed on `C:`. Optional `-EmptyRecycleBin`. |
+| 7 | **Defender** — signatures + QuickScan | Skipped if a third-party AV owns protection (or its engine is inactive). |
+| 8 | **Clock sync** — `w32tm /resync` | Resyncs the system clock; drift silently breaks SSL/cert/auth. |
+| — | **Reports** (always) | Disk health, **disk space (low-space warning)**, **filesystem dirty-bit**, **WinSxS store size**, DNS servers, **network connectivity (gateway/DNS/internet)**, **Event Viewer health analysis (7d)**, startup audit, power/battery, **pending-reboot status**. |
 
 The highest-leverage output is the **Event Viewer health analysis** — that's where
 real incidents surface. Cleanup is just hygiene.
@@ -54,6 +55,8 @@ real incidents surface. Cleanup is just hygiene.
 | `-FlushUpdateCache` | **Opt-in.** Stop wuauserv/bits, wipe `SoftwareDistribution\Download`, restart. Use when Windows Update is stuck. |
 | `-NetworkReset` | **Opt-in.** `netsh winsock reset` + `netsh int ip reset`. **Requires reboot**, may disrupt VPN/proxy. |
 | `-RepairIssues` | **Opt-in.** Attempt the safe auto-repairs the analysis flags — in practice a targeted `winget repair` (→ `upgrade` fallback) of crashing apps it can map to a single package. Skips what it can't map. (Alias: `-RepairCrashLoops`.) |
+| `-EmptyRecycleBin` | **Opt-in.** Empty the Recycle Bin (all drives). Opt-in since it deletes user-recoverable data. |
+| `-ResetStore` | **Opt-in.** Clear the Microsoft Store cache (`wsreset`) — fixes Store/UWP update errors. Opens the Store window when done. |
 
 ## Event Viewer health analysis
 

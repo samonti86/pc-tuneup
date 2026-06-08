@@ -44,6 +44,14 @@
     netsh winsock reset + netsh int ip reset. REQUIRES A REBOOT and can disrupt
     VPN/proxy config. Use only when the socket layer is corrupted.
 
+.PARAMETER EmptyRecycleBin
+    Empty the Recycle Bin on all drives and report space reclaimed. Opt-in because it
+    deletes user-recoverable data.
+
+.PARAMETER ResetStore
+    Clear the Microsoft Store cache (wsreset). Opt-in; useful for Store/UWP update
+    errors (e.g. 0x80073D02). Note: wsreset opens the Store window when it finishes.
+
 .PARAMETER RepairIssues
     Attempt the SAFE auto-repairs the health analysis flags. In practice that means a
     targeted winget repair (falling back to upgrade) of crashing apps it can map to a
@@ -76,7 +84,9 @@ param(
     [switch]$FlushUpdateCache,
     [switch]$NetworkReset,
     [Alias('RepairCrashLoops')]
-    [switch]$RepairIssues
+    [switch]$RepairIssues,
+    [switch]$EmptyRecycleBin,
+    [switch]$ResetStore
 )
 
 # ---------------------------------------------------------------------------
@@ -591,6 +601,71 @@ function Invoke-Defender {
     }
 }
 
+function Sync-SystemClock {
+    Write-Section "10. System clock sync (w32tm)"
+    # Clock drift silently breaks TLS/cert validation, Kerberos, and 2FA codes.
+    # Resyncing against the configured time source is safe and non-destructive.
+    if (-not (Test-CommandExists 'w32tm')) {
+        Add-Result 'Clock sync' 'Skipped' 'w32tm unavailable'; return
+    }
+    if (-not (Confirm-Action "w32tm /resync (sync the system clock)")) { Add-Result 'Clock sync' 'DryRun'; return }
+    # The Windows Time service must be running for a resync; it's trigger-started on
+    # standalone PCs, so nudge it first.
+    try {
+        if ((Get-Service w32time -ErrorAction Stop).Status -ne 'Running') {
+            Start-Service w32time -ErrorAction SilentlyContinue
+        }
+    } catch { Write-Verbose "w32time service not queryable: $($_.Exception.Message)" }
+    & w32tm /resync /force | Out-Null
+    $code = $LASTEXITCODE
+    if ($code -eq 0) {
+        Write-Host "  Clock resynced. Local time now: $(Get-Date)" -ForegroundColor Green
+        Add-Result 'Clock sync' 'OK' "resynced ($(Get-Date -Format 'HH:mm:ss'))"
+    } else {
+        Add-Result 'Clock sync' 'Partial' "w32tm exit $code"
+        Write-Warning "w32tm /resync returned $code (time service stopped or no time source configured)."
+    }
+}
+
+function Clear-RecycleBinSafe {
+    Write-Section "Cleanup: Recycle Bin"
+    # Opt-in: emptying the bin is real (recoverable) data loss, so never automatic.
+    if (-not $EmptyRecycleBin) { Add-Result 'Recycle Bin' 'Skipped' 'not requested (-EmptyRecycleBin)'; return }
+    if (-not (Confirm-Action "empty the Recycle Bin on all drives")) { Add-Result 'Recycle Bin' 'DryRun'; return }
+    try {
+        Clear-RecycleBin -Force -ErrorAction Stop
+        Write-Host "  Recycle Bin emptied." -ForegroundColor Green
+        Add-Result 'Recycle Bin' 'OK'
+    } catch {
+        # Clear-RecycleBin throws a benign error when the bin is already empty.
+        $m = ($_.Exception.Message -split "`r?`n")[0]
+        if ($m -match 'empty') {
+            Write-Host "  Recycle Bin already empty." -ForegroundColor Green
+            Add-Result 'Recycle Bin' 'OK' 'already empty'
+        } else {
+            Add-Result 'Recycle Bin' 'Failed' $m
+            Write-Warning "Empty Recycle Bin failed: $m"
+        }
+    }
+}
+
+function Reset-StoreCache {
+    Write-Section "Microsoft Store cache reset (wsreset)"
+    # Opt-in. wsreset clears the Store download cache -- the standard fix for Store/UWP
+    # install/update failures. It has no silent mode and opens the Store when done, so
+    # it's deliberately opt-in and we don't wait on it.
+    if (-not $ResetStore) { Add-Result 'Store cache reset' 'Skipped' 'not requested (-ResetStore)'; return }
+    if (-not (Test-CommandExists 'wsreset.exe')) { Add-Result 'Store cache reset' 'Skipped' 'wsreset unavailable'; return }
+    if (-not (Confirm-Action "wsreset.exe (clear Microsoft Store cache)")) { Add-Result 'Store cache reset' 'DryRun'; return }
+    try {
+        Start-Process -FilePath 'wsreset.exe' -WindowStyle Hidden -ErrorAction Stop
+        Write-Host "  wsreset launched (clears the Store cache; the Store may open briefly)." -ForegroundColor DarkGray
+        Add-Result 'Store cache reset' 'OK' 'wsreset launched'
+    } catch {
+        Add-Result 'Store cache reset' 'Failed' ($_.Exception.Message -split "`r?`n")[0]
+    }
+}
+
 # ===========================================================================
 # REPORT STEPS  (always run -- read-only)
 # ===========================================================================
@@ -615,6 +690,108 @@ function Get-DiskHealthReport {
         Write-Host "  Reliability counters unavailable on this hardware." -ForegroundColor DarkGray
     }
     Add-Result 'Disk health report' 'OK'
+}
+
+function Get-DiskSpaceReport {
+    Write-Section "Report: Disk space"
+    # Win32_LogicalDisk DriveType=3 = local fixed disks. Warn before a drive fills up
+    # (low free space causes update failures, paging thrash, and corruption risk).
+    $rows = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            $pct = if ($_.Size -gt 0) { [math]::Round($_.FreeSpace / $_.Size * 100, 1) } else { 0 }
+            [pscustomobject]@{
+                Drive      = $_.DeviceID
+                'Size(GB)' = [math]::Round($_.Size / 1GB, 1)
+                'Free(GB)' = [math]::Round($_.FreeSpace / 1GB, 1)
+                'Free%'    = $pct
+                Status     = if ($pct -lt 10) { 'LOW' } elseif ($pct -lt 15) { 'watch' } else { 'ok' }
+            }
+        })
+    $rows | Format-Table -AutoSize
+    $low = @($rows | Where-Object { $_.Status -eq 'LOW' })
+    if ($low) {
+        foreach ($d in $low) { Write-Host "  LOW SPACE: $($d.Drive) only $($d.'Free%')% free." -ForegroundColor Red }
+        Add-Result 'Disk space' 'OK' (($low | ForEach-Object { "$($_.Drive) $($_.'Free%')%" }) -join ', ')
+    } else {
+        Write-Host "  All fixed drives have healthy free space." -ForegroundColor Green
+        Add-Result 'Disk space' 'OK' 'all drives healthy'
+    }
+}
+
+function Get-DirtyBitReport {
+    Write-Section "Report: Filesystem dirty bit"
+    # A 'dirty' volume is flagged by Windows for an automatic chkdsk at next boot
+    # (suspected corruption). Surfacing it explains an upcoming boot-time chkdsk.
+    $dirty = @()
+    foreach ($d in @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue)) {
+        $out = (fsutil dirty query $d.DeviceID 2>$null | Out-String)
+        if ($out -match 'is Dirty' -and $out -notmatch 'NOT Dirty') {
+            $dirty += $d.DeviceID
+            Write-Host "  $($d.DeviceID) is marked DIRTY -- Windows will chkdsk it at next boot." -ForegroundColor Yellow
+        } else {
+            Write-Host "  $($d.DeviceID) clean." -ForegroundColor Green
+        }
+    }
+    if ($dirty) { Add-Result 'Dirty bit' 'OK' (($dirty -join ', ') + ' DIRTY') }
+    else        { Add-Result 'Dirty bit' 'OK' 'all clean' }
+}
+
+function Get-ComponentStoreReport {
+    Write-Section "Report: WinSxS component store"
+    # Read-only sizing (DISM /AnalyzeComponentStore) -- tells you the real on-disk size
+    # of WinSxS and whether Windows itself recommends a component cleanup. Takes ~15s.
+    $out = (DISM.exe /Online /Cleanup-Image /AnalyzeComponentStore 2>$null | Out-String)
+    if ($LASTEXITCODE -ne 0 -or -not $out) {
+        Write-Host "  Could not analyze the component store (DISM exit $LASTEXITCODE)." -ForegroundColor DarkGray
+        Add-Result 'Component store' 'Skipped' "DISM exit $LASTEXITCODE"
+        return
+    }
+    $actual = ([regex]::Match($out, 'Actual Size of Component Store\s*:\s*(.+)')).Groups[1].Value.Trim()
+    $rec    = ([regex]::Match($out, 'Component Store Cleanup Recommended\s*:\s*(\w+)')).Groups[1].Value.Trim()
+    if ($actual) { Write-Host "  Actual component store size: $actual" -ForegroundColor DarkGray }
+    if ($rec)    { Write-Host "  Cleanup recommended by Windows: $rec" -ForegroundColor $(if ($rec -eq 'Yes') { 'Yellow' } else { 'Green' }) }
+    Add-Result 'Component store' 'OK' ("size $actual; cleanup rec $rec")
+}
+
+function Get-ConnectivityReport {
+    Write-Section "Report: Network connectivity"
+    # Pure-.NET gateway discovery (no CDXML module dependency, which we've seen break).
+    # ICMP can be filtered on some networks, so treat NO REPLY as a hint, not gospel.
+    $results = @()
+    $gateways = @()
+    try {
+        $gateways = @([System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+            Where-Object { $_.OperationalStatus -eq 'Up' } |
+            ForEach-Object { $_.GetIPProperties().GatewayAddresses } |
+            ForEach-Object { $_.Address.IPAddressToString } |
+            Where-Object { $_ -and $_ -ne '0.0.0.0' -and $_ -notmatch '^fe80' } | Sort-Object -Unique)
+    } catch { Write-Verbose "Gateway enumeration failed: $($_.Exception.Message)" }
+
+    foreach ($gw in $gateways) {
+        $ok = Test-Connection -ComputerName $gw -Count 1 -Quiet -ErrorAction SilentlyContinue
+        $results += [pscustomobject]@{ Check = "Gateway $gw"; Result = $(if ($ok) { 'reachable' } else { 'NO REPLY' }) }
+    }
+    if (-not $gateways) { $results += [pscustomobject]@{ Check = 'Gateway'; Result = 'none found' } }
+
+    $netOk = Test-Connection -ComputerName '1.1.1.1' -Count 1 -Quiet -ErrorAction SilentlyContinue
+    $results += [pscustomobject]@{ Check = 'Internet (1.1.1.1)'; Result = $(if ($netOk) { 'reachable' } else { 'NO REPLY' }) }
+
+    try {
+        $null = [System.Net.Dns]::GetHostEntry('www.microsoft.com')
+        $results += [pscustomobject]@{ Check = 'DNS resolution'; Result = 'working' }
+    } catch {
+        $results += [pscustomobject]@{ Check = 'DNS resolution'; Result = 'FAILED' }
+    }
+
+    $results | Format-Table -AutoSize
+    $bad = @($results | Where-Object { $_.Result -match 'NO REPLY|FAILED' })
+    if ($bad) {
+        Write-Host "  Connectivity issues (ICMP may be filtered -- verify before acting)." -ForegroundColor Yellow
+        Add-Result 'Connectivity' 'OK' ((($bad | ForEach-Object { $_.Check }) -join ', ') + ' failing')
+    } else {
+        Write-Host "  Network connectivity looks healthy." -ForegroundColor Green
+        Add-Result 'Connectivity' 'OK' 'gateway/internet/DNS ok'
+    }
 }
 
 # Knowledge base of known event-log issue types. Each rule matches by provider
@@ -895,14 +1072,21 @@ try {
         Invoke-Step 'Filesystem check'   { Invoke-ChkdskScan }
         Invoke-Step 'Drive optimization' { Optimize-Drives }
         Invoke-Step 'Cleanup'            { Clear-TempFiles }
+        Invoke-Step 'Recycle Bin'        { Clear-RecycleBinSafe }
         Invoke-Step 'Update-cache flush' { Clear-UpdateCache }
         Invoke-Step 'Network reset'      { Reset-NetworkStack }
         Invoke-Step 'Defender'           { Invoke-Defender }
+        Invoke-Step 'Clock sync'         { Sync-SystemClock }
+        Invoke-Step 'Store cache reset'  { Reset-StoreCache }
     }
 
     # Read-only reporting always runs.
     Invoke-Step 'Disk health'       { Get-DiskHealthReport }
+    Invoke-Step 'Disk space'        { Get-DiskSpaceReport }
+    Invoke-Step 'Dirty bit'         { Get-DirtyBitReport }
+    Invoke-Step 'Component store'   { Get-ComponentStoreReport }
     Invoke-Step 'DNS report'        { Get-NetworkReport }
+    Invoke-Step 'Connectivity'      { Get-ConnectivityReport }
     Invoke-Step 'Health report'     { Get-HealthReport }
     Invoke-Step 'Startup audit'     { Get-StartupAudit }
     Invoke-Step 'Power report'      { Get-PowerReport }

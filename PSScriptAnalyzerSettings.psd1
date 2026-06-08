@@ -19,9 +19,16 @@
     #    Repair-CrashLoops, Test-CommandExists) are INTERNAL helpers, never exported. The
     #    singular-noun convention targets public cmdlet surfaces; renaming would only churn
     #    call sites with no caller-facing benefit.
+    #
+    #  PSAvoidUsingComputerNameHardcoded
+    #    The only hardcoded target is the public DNS IP 1.1.1.1, used deliberately as an
+    #    internet-reachability probe in the connectivity report. The rule exists to stop
+    #    leaking INTERNAL/sensitive machine names in shared scripts -- a public anycast IP
+    #    is not sensitive, so this is exactly the intended, safe use.
     ExcludeRules = @(
         'PSAvoidUsingWriteHost',
         'PSUseShouldProcessForStateChangingFunctions',
-        'PSUseSingularNouns'
+        'PSUseSingularNouns',
+        'PSAvoidUsingComputerNameHardcoded'
     )
 }
