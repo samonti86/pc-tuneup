@@ -110,9 +110,19 @@ if (-not (Test-IsAdmin)) {
 $script:DryRun  = [bool]$DryRun
 $script:Results = New-Object System.Collections.Generic.List[object]
 
-$logDir = Join-Path $env:USERPROFILE 'pc-tuneup-logs'
-if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
-$logFile = Join-Path $logDir ("tuneup-" + (Get-Date -Format 'yyyy-MM-dd-HHmmss') + ".log")
+$script:RunStamp = Get-Date -Format 'yyyy-MM-dd-HHmmss'
+$script:LogDir   = Join-Path $env:USERPROFILE 'pc-tuneup-logs'
+if (-not (Test-Path $script:LogDir)) { New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null }
+
+# Retention: keep only the most recent 30 of each artifact so the log dir doesn't
+# grow without bound across monthly runs. Pruned BEFORE this run's files are created.
+foreach ($pat in 'tuneup-*.log', 'energy-report-*.html', 'battery-report-*.html') {
+    Get-ChildItem $script:LogDir -Filter $pat -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -Skip 30 |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+}
+
+$logFile = Join-Path $script:LogDir "tuneup-$($script:RunStamp).log"
 Start-Transcript -Path $logFile | Out-Null
 
 # ---------------------------------------------------------------------------
@@ -208,7 +218,8 @@ function Resolve-WingetId {
     param([string]$App, [string]$Path)
     $term = $null
     if ($Path -and (Test-Path $Path -ErrorAction SilentlyContinue)) {
-        try { $term = (Get-Item $Path -ErrorAction Stop).VersionInfo.ProductName } catch { }
+        try { $term = (Get-Item $Path -ErrorAction Stop).VersionInfo.ProductName }
+        catch { Write-Verbose "ProductName lookup failed for '$Path'; will fall back to the exe base name." }
     }
     if (-not $term) { $term = [System.IO.Path]::GetFileNameWithoutExtension($App) }
     if (-not $term) { return $null }
@@ -220,7 +231,7 @@ function Resolve-WingetId {
                 ForEach-Object { $_.Id } | Sort-Object -Unique)
             if ($ids.Count -eq 1) { return $ids[0] }
             return $null
-        } catch { }
+        } catch { Write-Verbose "Get-WinGetPackage query failed; falling back to the winget CLI." }
     }
     $out = (winget list --name $term --accept-source-agreements 2>$null | Out-String)
     return (Get-WingetIdFromListing -Raw $out)
@@ -246,6 +257,22 @@ function Invoke-Native {
     } else {
         Add-Result $Label 'Failed' "exit $code"
         Write-Warning "$Label returned exit code $code"
+    }
+}
+
+# Run one pipeline step in isolation. A step that throws an UNHANDLED error is
+# logged and recorded as Failed, but never aborts the remaining steps or the
+# end-of-run summary. Without this, a single throw (e.g. Get-PhysicalDisk failing
+# on odd hardware) would skip every later step AND the summary -- the worst outcome
+# for a maintenance tool, since you'd lose the report of what did/didn't happen.
+function Invoke-Step {
+    param([string]$Name, [scriptblock]$Body)
+    try {
+        & $Body
+    } catch {
+        $msg = ($_.Exception.Message -split "`r?`n")[0]
+        Write-Warning "Step '$Name' hit an unhandled error: $msg"
+        Add-Result $Name 'Failed' "unhandled: $msg"
     }
 }
 
@@ -297,7 +324,16 @@ function Update-Apps {
     winget upgrade --all --include-unknown `
         --accept-source-agreements --accept-package-agreements `
         --silent --disable-interactivity
-    Add-Result 'App updates (winget)' 'OK'
+    # Don't claim success blindly: winget returns non-zero when some packages fail
+    # to upgrade. Surface that as Partial rather than a false OK. (Exit 0 includes the
+    # benign "nothing to upgrade" case, so that still reports OK.)
+    $code = $LASTEXITCODE
+    if ($code -eq 0) {
+        Add-Result 'App updates (winget)' 'OK'
+    } else {
+        Add-Result 'App updates (winget)' 'Partial' ("winget exit {0} (0x{0:X8})" -f $code)
+        Write-Warning "winget upgrade --all returned exit $code -- one or more apps may not have updated."
+    }
 }
 
 function Repair-CrashLoops {
@@ -451,8 +487,11 @@ function Clear-TempFiles {
     $afterGB = Get-FreeSpaceGB 'C'
     if (-not $DryRun -and $null -ne $beforeGB -and $null -ne $afterGB) {
         $reclaimed = [math]::Round($afterGB - $beforeGB, 2)
-        Write-Host ("  C: free space  {0} GB -> {1} GB  (reclaimed {2} GB)" -f $beforeGB, $afterGB, $reclaimed) -ForegroundColor Green
-        Add-Result 'Space reclaimed' 'OK' ("{0} GB (C: {1}->{2} GB)" -f $reclaimed, $beforeGB, $afterGB)
+        # Free space can DROP mid-run (a background process or the Defender scan writing),
+        # making this negative. Label it "net change" then so the number isn't misread.
+        $word = if ($reclaimed -lt 0) { 'net change' } else { 'reclaimed' }
+        Write-Host ("  C: free space  {0} GB -> {1} GB  ({2} {3} GB)" -f $beforeGB, $afterGB, $word, $reclaimed) -ForegroundColor Green
+        Add-Result 'Space reclaimed' 'OK' ("{0} {1} GB (C: {2}->{3} GB)" -f $word, $reclaimed, $beforeGB, $afterGB)
     }
 }
 
@@ -651,13 +690,15 @@ function Get-StartupAudit {
 
 function Get-PowerReport {
     Write-Section "Report: Power / battery"
-    # /energy works on desktops too; battery/sleepstudy need a battery.
-    $energyPath = Join-Path $env:USERPROFILE 'energy-report.html'
+    # /energy works on desktops too; battery/sleepstudy need a battery. Reports land
+    # in the log dir (timestamped, retention-pruned) instead of cluttering $USERPROFILE.
+    $energyPath = Join-Path $script:LogDir "energy-report-$($script:RunStamp).html"
     Invoke-Native 'Power energy report' 'powercfg.exe' @('/energy','/output',"`"$energyPath`"","/duration","20")
+    if (-not $script:DryRun) { Write-Host "  Energy report: $energyPath" -ForegroundColor DarkGray }
     if (Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue) {
-        $battPath = Join-Path $env:USERPROFILE 'battery-report.html'
+        $battPath = Join-Path $script:LogDir "battery-report-$($script:RunStamp).html"
         Invoke-Native 'Battery report' 'powercfg.exe' @('/batteryreport','/output',"`"$battPath`"")
-        Write-Host "  Battery report: $battPath" -ForegroundColor DarkGray
+        if (-not $script:DryRun) { Write-Host "  Battery report: $battPath" -ForegroundColor DarkGray }
     } else {
         Write-Host "  No battery detected -- skipping battery report (desktop)." -ForegroundColor DarkGray
         Add-Result 'Battery report' 'Skipped' 'no battery'
@@ -742,31 +783,32 @@ Write-Host "Log: $logFile" -ForegroundColor DarkGray
 
 try {
     # Detect crash loops up front (read-only) so the opt-in repair step below can
-    # act on the same scan the report renders later.
-    Find-CrashLoops
+    # act on the same scan the report renders later. Every step runs via Invoke-Step
+    # so one unhandled throw can't sink the rest of the run or the summary.
+    Invoke-Step 'Crash-loop detection' { Find-CrashLoops }
 
     if (-not $ReportOnly) {
-        New-RestoreCheckpoint
-        Update-Apps
-        Repair-CrashLoops
-        Invoke-OSUpdate
-        Repair-SystemIntegrity
-        Invoke-ChkdskScan
-        Optimize-Drives
-        Clear-TempFiles
-        Clear-UpdateCache
-        Reset-NetworkStack
-        Invoke-Defender
+        Invoke-Step 'Restore point'      { New-RestoreCheckpoint }
+        Invoke-Step 'App updates'        { Update-Apps }
+        Invoke-Step 'Crash-loop repair'  { Repair-CrashLoops }
+        Invoke-Step 'Windows Update'     { Invoke-OSUpdate }
+        Invoke-Step 'System integrity'   { Repair-SystemIntegrity }
+        Invoke-Step 'Filesystem check'   { Invoke-ChkdskScan }
+        Invoke-Step 'Drive optimization' { Optimize-Drives }
+        Invoke-Step 'Cleanup'            { Clear-TempFiles }
+        Invoke-Step 'Update-cache flush' { Clear-UpdateCache }
+        Invoke-Step 'Network reset'      { Reset-NetworkStack }
+        Invoke-Step 'Defender'           { Invoke-Defender }
     }
 
     # Read-only reporting always runs.
-    Get-DiskHealthReport
-    Get-NetworkReport
-    Get-EventSummary
-    Get-CrashLoopReport
-    Get-StartupAudit
-    Get-PowerReport
-    Get-PendingRebootReport
+    Invoke-Step 'Disk health'       { Get-DiskHealthReport }
+    Invoke-Step 'DNS report'        { Get-NetworkReport }
+    Invoke-Step 'Event sweep'       { Get-EventSummary }
+    Invoke-Step 'Crash-loop report' { Get-CrashLoopReport }
+    Invoke-Step 'Startup audit'     { Get-StartupAudit }
+    Invoke-Step 'Power report'      { Get-PowerReport }
+    Invoke-Step 'Pending reboot'    { Get-PendingRebootReport }
 
     # ----- Summary -----
     Write-Section "Summary"

@@ -73,9 +73,12 @@ exactly what `winget` does.
 ## Output & logging
 
 - Every run is transcript-logged to `%USERPROFILE%\pc-tuneup-logs\tuneup-<timestamp>.log`.
-- Power/battery reports are written to `%USERPROFILE%\energy-report.html` and
-  `battery-report.html`.
-- The run ends with a status table (OK / Skipped / DryRun / Failed) per step.
+- Power/battery reports land in the same folder, timestamped
+  (`energy-report-<timestamp>.html`, `battery-report-<timestamp>.html`).
+- Only the most recent **30** of each artifact are kept; older ones are pruned each run.
+- The run ends with a status table (OK / Partial / Skipped / DryRun / Failed) per step.
+- Each step is isolated: an unexpected error in one step is recorded and the run
+  continues, so you always get the full summary.
 
 ## Compatibility notes
 

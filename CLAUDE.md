@@ -35,8 +35,11 @@ Origin research (the verified command spec this script implements) lives in
   ```powershell
   $e=$null;$t=$null;[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\Invoke-PCTuneup.ps1),[ref]$t,[ref]$e)|Out-Null; if($e){$e|%{ "$($_.Extent.StartLineNumber): $($_.Message)" }}else{'PARSE OK'}
   ```
-  If PSScriptAnalyzer is installed, also run:
-  `Invoke-ScriptAnalyzer -Path .\Invoke-PCTuneup.ps1 -Severity Warning,Error`
+  If PSScriptAnalyzer is installed, also run (must be CLEAN):
+  `Invoke-ScriptAnalyzer -Path .\Invoke-PCTuneup.ps1 -Settings .\PSScriptAnalyzerSettings.psd1 -Severity Warning,Error`
+  The settings file excludes 3 rules that are deliberate design choices here
+  (Write-Host UX, custom -DryRun vs ShouldProcess, plural internal-helper nouns) —
+  each with rationale in the .psd1. Any OTHER warning is a real finding; fix it.
 
 ## Constraints & Rules
 - **Cross-version first.** Anything added must work on Win10 1809+ AND Win11. If a
@@ -88,6 +91,13 @@ Origin research (the verified command spec this script implements) lives in
       a stopped engine, so Invoke-Defender now checks the engine state and reports an accurate
       'Skipped: engine inactive; another AV is primary' (not a guess, not a Failed). Corrects
       the earlier wrong expectation that the next run would scan. Verified 5.1+7.6 (2026-06-07)
+- [x] Deep-dive QA pass (2026-06-07): added Invoke-Step so a single unhandled throw can no
+      longer abort the remaining steps + summary (biggest robustness gap); winget exit code
+      now captured in Update-Apps (Partial vs false OK); log retention (keep last 30 of each
+      artifact); power/battery reports moved into the log dir, timestamped (declutter $USERPROFILE);
+      reclaimed-space labels negative deltas as "net change"; fixed 2 empty catch blocks. Added
+      PSScriptAnalyzerSettings.psd1 (3 documented rule exclusions) -> PSSA now CLEAN. Verified
+      parse + PSSA-clean + Invoke-Step isolation under 5.1 AND 7.6 (2026-06-07)
 - [ ] Re-run elevated end-to-end to confirm DNS flush now EXECUTES (Defender will correctly
       skip -- Malwarebytes is primary; that's expected, not a bug)
 - [ ] User action: fix ExpressVPN BrowserHelper crash loop (update/reinstall ExpressVPN
