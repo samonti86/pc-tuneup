@@ -135,9 +135,13 @@ Origin research (the verified command spec this script implements) lives in
       bubble up. New -EventDays N param (default 7, 1-365) narrows the window. Verified on live
       logs 5.1+7.6: App crashes (ExpressVPN, uninstalled) correctly tagged stale/0-recent; Service
       crashes 40-in-24h sorted above it; -EventDays 1 drops the stale categories (2026-06-08)
-- [ ] User action: ExpressVPN app crashes are now STALE (uninstalled, 0 in 24h) -- but its
-      SERVICES still crashed ~40x in the last 24h (leftover service remnants?). Check services.msc
-      for orphaned ExpressVPN services if the Service-crashes category stays hot next run.
+- [x] ExpressVPN post-uninstall investigation (2026-06-08): the ~40 service crashes "in last 24h"
+      were REAL but PRE-uninstall -- 7031 crashes 11:40-11:55 AM, user uninstalled ~2:08 PM (7040
+      events), tuneup ran 2:19 PM, so this morning's crashes were still inside the 24h window. Win32
+      services genuinely gone (Get-Service none). BUT uninstall left 2 orphaned KERNEL DRIVERS still
+      RUNNING: expressvpntun + tapexpressvpn (Type=1, Start=manual) -- invisible in services.msc
+      (drivers, not services). No leftover Run keys / scheduled tasks / install folders. User action:
+      'sc.exe stop/delete expressvpntun tapexpressvpn' then reboot (already pending from chkdsk /f /r)
 - [ ] Test on a Windows 10 machine to confirm cross-version behavior
 - [ ] Optional: add to command-center projects-index
 - [ ] Optional: scheduled-task wrapper for monthly auto-run
