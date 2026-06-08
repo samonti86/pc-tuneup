@@ -128,9 +128,16 @@ Origin research (the verified command spec this script implements) lives in
       RELATIVE, and prepended the cwd -- mislocating the energy/battery report. Fixed by passing
       the bare path (PS auto-quotes native args with spaces). Parse + PSSA-clean; netsh classifier
       verified against the real log output (2026-06-08)
-- [ ] User action: fix ExpressVPN (BrowserHelper crashes 336x/7d + its 3 services crash 28x);
-      reinstall/update or remove -- it dominates both event logs. winget now maps it
-      (XP9M14XF781P6R), so '-RepairIssues' can attempt it; or remove ExpressVPN outright
+- [x] Health-report RECENCY (2026-06-08, user feedback): stale events (e.g. crashes from an app
+      since uninstalled) cluttered the 7d view with no way to tell active from resolved. Added
+      per-issue first/last-seen timestamps + a "last 24h" count + a "(no activity in last 24h --
+      may already be resolved)" tag; sort is now severity -> recent-active -> volume so live issues
+      bubble up. New -EventDays N param (default 7, 1-365) narrows the window. Verified on live
+      logs 5.1+7.6: App crashes (ExpressVPN, uninstalled) correctly tagged stale/0-recent; Service
+      crashes 40-in-24h sorted above it; -EventDays 1 drops the stale categories (2026-06-08)
+- [ ] User action: ExpressVPN app crashes are now STALE (uninstalled, 0 in 24h) -- but its
+      SERVICES still crashed ~40x in the last 24h (leftover service remnants?). Check services.msc
+      for orphaned ExpressVPN services if the Service-crashes category stays hot next run.
 - [ ] Test on a Windows 10 machine to confirm cross-version behavior
 - [ ] Optional: add to command-center projects-index
 - [ ] Optional: scheduled-task wrapper for monthly auto-run

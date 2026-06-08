@@ -57,14 +57,16 @@ real incidents surface. Cleanup is just hygiene.
 | `-RepairIssues` | **Opt-in.** Attempt the safe auto-repairs the analysis flags — in practice a targeted `winget repair` (→ `upgrade` fallback) of crashing apps it can map to a single package. Skips what it can't map. (Alias: `-RepairCrashLoops`.) |
 | `-EmptyRecycleBin` | **Opt-in.** Empty the Recycle Bin (all drives). Opt-in since it deletes user-recoverable data. |
 | `-ResetStore` | **Opt-in.** Clear the Microsoft Store cache (`wsreset`) — fixes Store/UWP update errors. Opens the Store window when done. |
+| `-EventDays N` | Days of Event Viewer history the health analysis covers (default 7, range 1-365). Lower it (e.g. `-EventDays 1`) to focus on only recent issues. |
 
 ## Event Viewer health analysis
 
 This is the highest-value output. It does **one** sweep of the System + Application
-logs (Critical/Error, last 7 days), then **classifies** each error source against a
-built-in knowledge base instead of just dumping raw counts. Each issue is shown with a
-**severity** (High / Medium / Low), the specific culprits (faulting apps or service
-names), and a **safe recommendation**:
+logs (Critical/Error, last 7 days — adjustable with `-EventDays`), then **classifies**
+each error source against a built-in knowledge base instead of just dumping raw counts.
+Each issue is shown with a **severity** (High / Medium / Low), the specific culprits
+(faulting apps or service names), **first/last-seen timestamps and a "last 24h" count**,
+and a **safe recommendation**:
 
 - **High** — surfaced even at low volume: disk/filesystem errors, hardware (WHEA),
   unexpected shutdowns.

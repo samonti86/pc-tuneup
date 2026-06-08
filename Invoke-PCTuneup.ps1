@@ -44,6 +44,12 @@
     netsh winsock reset + netsh int ip reset. REQUIRES A REBOOT and can disrupt
     VPN/proxy config. Use only when the socket layer is corrupted.
 
+.PARAMETER EventDays
+    How many days of Event Viewer history the health analysis covers (default 7,
+    range 1-365). Lower it (e.g. -EventDays 1) to focus on only the most recent issues.
+    Each issue also shows first/last-seen timestamps and a "last 24h" count, so stale,
+    already-resolved problems are easy to tell apart from active ones.
+
 .PARAMETER EmptyRecycleBin
     Empty the Recycle Bin on all drives and report space reclaimed. Opt-in because it
     deletes user-recoverable data.
@@ -86,7 +92,9 @@ param(
     [Alias('RepairCrashLoops')]
     [switch]$RepairIssues,
     [switch]$EmptyRecycleBin,
-    [switch]$ResetStore
+    [switch]$ResetStore,
+    [ValidateRange(1, 365)]
+    [int]$EventDays = 7
 )
 
 # ---------------------------------------------------------------------------
@@ -875,11 +883,13 @@ function Resolve-IssueRule {
 }
 
 function Find-EventIssues {
-    # READ-ONLY. ONE sweep of System + Application (Critical+Error, 7d). Groups by
-    # source, classifies each against the knowledge base, merges by category, and
+    # READ-ONLY. ONE sweep of System + Application (Critical+Error, last $EventDays days).
+    # Groups by source, classifies against the knowledge base, merges by category, and
     # populates $script:Issues. High-severity issues surface even at low counts; lower
-    # ones need volume ($noiseFloor) first. Also records raw per-log totals for the header.
-    $since = (Get-Date).AddDays(-7)
+    # ones need volume ($noiseFloor) first. Each issue carries first/last-seen + a 24h
+    # count so stale (likely-resolved) problems are distinguishable from active ones.
+    $since = (Get-Date).AddDays(-$EventDays)
+    $recentCutoff = (Get-Date).AddHours(-24)
     $noiseFloor = 5
     $script:Issues = @()
     $script:EventTotals = [ordered]@{}
@@ -910,6 +920,9 @@ function Find-EventIssues {
                 Events     = @()
                 Detail     = ''
                 Apps       = @()
+                First      = $null
+                Last       = $null
+                Recent24h  = 0
             }
         }
         $cats[$cat].Count  += $g.Count
@@ -919,6 +932,14 @@ function Find-EventIssues {
     foreach ($entry in $cats.Values) {
         # Surface High always; otherwise require the noise floor.
         if ($entry.Severity -ne 'High' -and $entry.Count -lt $noiseFloor) { continue }
+
+        # Recency: first/last-seen + how many landed in the last 24h. This is what tells
+        # an ACTIVE problem apart from a stale one (e.g. crashes from an app you've since
+        # uninstalled still sit in the 7-day window but have 0 recent events).
+        $sorted = @($entry.Events | Sort-Object TimeCreated)
+        $entry.First     = $sorted[0].TimeCreated
+        $entry.Last      = $sorted[-1].TimeCreated
+        $entry.Recent24h = @($entry.Events | Where-Object { $_.TimeCreated -ge $recentCutoff }).Count
 
         if ($entry.AutoRepair -eq 'winget-app') {
             # Per-exe crash counts from Application Error (1000) for targeted repair.
@@ -951,12 +972,18 @@ function Find-EventIssues {
         $script:Issues += $entry
     }
 
+    # Sort by severity, then ACTIVE-first (recent activity), then volume -- so live
+    # issues bubble above stale ones within each severity band.
     $rank = @{ High = 0; Medium = 1; Low = 2 }
-    $script:Issues = @($script:Issues | Sort-Object @{ Expression = { $rank[$_.Severity] } }, @{ Expression = 'Count'; Descending = $true })
+    $script:Issues = @($script:Issues | Sort-Object `
+            @{ Expression = { $rank[$_.Severity] } }, `
+            @{ Expression = 'Recent24h'; Descending = $true }, `
+            @{ Expression = 'Count'; Descending = $true })
 }
 
 function Get-HealthReport {
-    Write-Section "Report: System health (Event Viewer analysis, last 7 days)"
+    $span = "last $EventDays day$(if ($EventDays -ne 1) { 's' })"
+    Write-Section "Report: System health (Event Viewer analysis, $span)"
     foreach ($k in $script:EventTotals.Keys) {
         Write-Host ("  {0,-12}: {1} critical/error events" -f $k, $script:EventTotals[$k]) -ForegroundColor DarkGray
     }
@@ -968,14 +995,20 @@ function Get-HealthReport {
     Write-Host ""
     $color = @{ High = 'Red'; Medium = 'Yellow'; Low = 'DarkGray' }
     foreach ($i in $script:Issues) {
-        Write-Host ("  [{0}] {1}  --  {2} event(s)" -f $i.Severity.ToUpper(), $i.Category, $i.Count) -ForegroundColor $color[$i.Severity]
+        $recentTxt = if ($i.Recent24h -gt 0) { "$($i.Recent24h) in last 24h" } else { 'none in last 24h' }
+        Write-Host ("  [{0}] {1}  --  {2} event(s), {3}" -f $i.Severity.ToUpper(), $i.Category, $i.Count, $recentTxt) -ForegroundColor $color[$i.Severity]
         if ($i.Detail) { Write-Host "      $($i.Detail)" -ForegroundColor DarkGray }
+        Write-Host ("      first: {0:g}   last: {1:g}" -f $i.First, $i.Last) -ForegroundColor DarkGray
+        # The staleness cue the user asked for: no recent events => probably already fixed.
+        if ($i.Recent24h -eq 0) {
+            Write-Host "      (no activity in the last 24h -- may already be resolved)" -ForegroundColor DarkGreen
+        }
         Write-Host "      -> $($i.Advice)" -ForegroundColor Gray
         if ($i.AutoRepair -eq 'winget-app' -and $i.Apps) {
             $hint = if ($RepairIssues) { 'auto-repair runs in step 1b' } else { 're-run with -RepairIssues to attempt a safe winget repair' }
             Write-Host "      [safe auto-repair available -- $hint]" -ForegroundColor DarkCyan
         }
-        Add-Result "Issue: $($i.Category)" 'OK' ("{0}; {1} events" -f $i.Severity, $i.Count)
+        Add-Result "Issue: $($i.Category)" 'OK' ("{0}; {1} events; {2}; last {3:M/d}" -f $i.Severity, $i.Count, $recentTxt, $i.Last)
     }
 }
 
