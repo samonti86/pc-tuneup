@@ -142,6 +142,47 @@ Origin research (the verified command spec this script implements) lives in
       RUNNING: expressvpntun + tapexpressvpn (Type=1, Start=manual) -- invisible in services.msc
       (drivers, not services). No leftover Run keys / scheduled tasks / install folders. User action:
       'sc.exe stop/delete expressvpntun tapexpressvpn' then reboot (already pending from chkdsk /f /r)
+- [x] End-to-end proofread + public-repo documentation pass (2026-08-03). Full read of all
+      1170 lines looking for correctness bugs. Found and fixed 4 real ones + 3 hygiene:
+      (1) SELF-ELEVATION DROPPED VALUE PARAMS -- the forwarding loop only re-passed
+      switches (`$kv.Value -is [switch] -and .IsPresent`), so `-EventDays 1` from a
+      non-elevated prompt silently reverted to the default 7 in the elevated child. No
+      error, just wrong behavior. Now forwards name+value for non-switch params (quoting
+      values containing whitespace) and skips a hand-passed -Relaunched to avoid a
+      duplicate-parameter bind error. Verified with 4 cases incl. the exact bug.
+      (2) DISM EXIT 3010 = ERROR_SUCCESS_REBOOT_REQUIRED was reported FAILED -- Invoke-Native
+      only accepted 0, so a successful RestoreHealth/StartComponentCleanup needing a reboot
+      looked like a hard failure (same false-failure class as the netsh fix). Both DISM call
+      sites now pass -SuccessCodes @(0,3010); Invoke-Native labels 3010 'success; reboot
+      required'. Verified via `cmd /c exit 3010`.
+      (3) chkdsk /f /r scheduling never checked $LASTEXITCODE -- flat 'OK' even if scheduling
+      failed, promising a boot-time check that would never run. Now Partial + warning on
+      non-zero (pending-reboot report is the cross-check).
+      (4) TRANSCRIPT HIJACK -- if the caller already had a transcript running, Start-Transcript
+      errored and the unconditional Stop-Transcript in `finally` tore down THEIR transcript.
+      Now tracks $script:TranscriptStarted and only stops its own; warns + continues if it
+      can't log.
+      Hygiene: @() guard in Get-WingetIdFromListing (single surviving line -> bare [string]
+      broke [array]::IndexOf); Detail fallback so an app-crash category built only from hangs
+      (1002)/.NET Runtime events can't render a blank line; summary Format-Table -Wrap so the
+      Detail column stops truncating; numbered the 2 unnumbered sections (Recycle Bin -> 6b,
+      Store -> 11) so printed headers run 0..11 and docs can mirror them exactly.
+      UX: added internal -Relaunched switch -- the UAC-spawned window used to slam shut on
+      completion, taking the whole report with it; it now pauses on Enter. Gated so an
+      already-elevated/scheduled run never blocks on input.
+      NOT changed (deliberate): w32tm `/resync /force` -- suspected invalid, but empirically
+      w32tm ACCEPTS /force (an invalid flag like /bogusflag fails with 0x80070057, /force
+      doesn't). Left as-is. Also left: script still returns exit 0 even when steps fail
+      (documented as a known limitation in README rather than silently changing behavior).
+      Verified: parse OK 5.1 + 7.6, PSSA clean, AST-loaded smoke test of every changed path.
+- [x] README rewritten as a public-repo front door (2026-08-03): TOC, requirements, install
+      (incl. Unblock-File), quick start, step-by-step table matching the script's printed
+      numbering, always-on report table, health-analysis anatomy with an ILLUSTRATIVE
+      (not real-machine -- repo is public) example, full param table, 9 copy-paste recipes,
+      status-code glossary, logs + PRIVACY warning (logs name drives/apps/DNS/startup --
+      review before pasting into an issue), safety model + explicit "will not do" list,
+      11-entry FAQ, scheduled-task recipe, compatibility (incl. PS7 Checkpoint-Computer
+      caveat + non-English parsing caveat), dev/sanity-gate section.
 - [ ] Test on a Windows 10 machine to confirm cross-version behavior
 - [ ] Optional: add to command-center projects-index
 - [ ] Optional: scheduled-task wrapper for monthly auto-run

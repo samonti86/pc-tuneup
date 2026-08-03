@@ -67,6 +67,11 @@
     Viewer analysis itself is always-on and read-only; only the repair is gated by this.
     (Alias: -RepairCrashLoops, kept for compatibility.)
 
+.PARAMETER Relaunched
+    INTERNAL. Set automatically when the script relaunches itself through UAC; it only
+    makes the new elevated window pause before closing so you can read the report.
+    Don't pass it by hand -- an already-elevated or scheduled run must never pause.
+
 .EXAMPLE
     .\Invoke-PCTuneup.ps1
     Run the safe monthly routine (self-elevates).
@@ -94,7 +99,11 @@ param(
     [switch]$EmptyRecycleBin,
     [switch]$ResetStore,
     [ValidateRange(1, 365)]
-    [int]$EventDays = 7
+    [int]$EventDays = 7,
+    # INTERNAL -- set automatically by the UAC relaunch below, not meant to be passed
+    # by hand. It only makes the elevated window pause before closing so the report is
+    # readable; an already-elevated or scheduled run never sets it and never pauses.
+    [switch]$Relaunched
 )
 
 # ---------------------------------------------------------------------------
@@ -111,11 +120,22 @@ function Test-IsAdmin {
 
 if (-not (Test-IsAdmin)) {
     Write-Host "Administrator rights required -- relaunching via UAC..." -ForegroundColor Yellow
-    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Relaunched')
     foreach ($kv in $PSBoundParameters.GetEnumerator()) {
-        # All our params are switches; only forward the ones actually present.
-        if ($kv.Value -is [switch] -and $kv.Value.IsPresent) {
+        # -Relaunched is added above; never forward it twice (PowerShell rejects a
+        # parameter specified more than once).
+        if ($kv.Key -eq 'Relaunched') { continue }
+        if ($kv.Value -is [switch]) {
+            # Switches forward as a bare -Name, and only when actually present.
+            if ($kv.Value.IsPresent) { $argList += "-$($kv.Key)" }
+        } else {
+            # VALUE-carrying params (e.g. -EventDays 1) must forward their value too.
+            # Forwarding only the switches silently dropped these across the UAC hop,
+            # so the elevated child quietly fell back to the default -- the worst kind
+            # of bug: no error, just the wrong behaviour.
             $argList += "-$($kv.Key)"
+            $val = "$($kv.Value)"
+            $argList += $(if ($val -match '\s') { "`"$val`"" } else { $val })
         }
     }
     try {
@@ -145,7 +165,17 @@ foreach ($pat in 'tuneup-*.log', 'energy-report-*.html', 'battery-report-*.html'
 }
 
 $logFile = Join-Path $script:LogDir "tuneup-$($script:RunStamp).log"
-Start-Transcript -Path $logFile | Out-Null
+# Only stop a transcript we actually started. If the CALLER already had one running,
+# Start-Transcript errors here -- and an unconditional Stop-Transcript in the finally
+# block would then tear down THEIR transcript instead of ours.
+$script:TranscriptStarted = $false
+try {
+    Start-Transcript -Path $logFile -ErrorAction Stop | Out-Null
+    $script:TranscriptStarted = $true
+} catch {
+    Write-Warning "Could not start the transcript log ($logFile): $(($_.Exception.Message -split "`r?`n")[0])"
+    Write-Warning "Continuing WITHOUT a log file -- console output only."
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -213,7 +243,9 @@ function Convert-ExceptionCode {
 function Get-WingetIdFromListing {
     param([string]$Raw)
     if (-not $Raw) { return $null }
-    $lines  = $Raw -split "\r?\n" | Where-Object { $_ -and ($_ -notmatch '^[\s\-\\|/]+$') }
+    # @() is load-bearing: with a single surviving line the pipeline yields a bare
+    # [string], and [array]::IndexOf() below would then choke on a non-array.
+    $lines  = @($Raw -split "\r?\n" | Where-Object { $_ -and ($_ -notmatch '^[\s\-\\|/]+$') })
     $header = $lines | Where-Object { $_ -match '(^|\s)Id(\s|$)' -and $_ -match 'Version' } | Select-Object -First 1
     if (-not $header) { return $null }
     $idCol  = $header.IndexOf('Id')
@@ -275,6 +307,14 @@ function Invoke-Native {
     & $File @Arguments
     $code = $LASTEXITCODE
     if ($SuccessCodes -contains $code) {
+        # 3010 = ERROR_SUCCESS_REBOOT_REQUIRED. It means SUCCESS, pending a restart --
+        # DISM returns it routinely. Callers opt into it via -SuccessCodes; label it
+        # clearly so "exit 3010" never reads like a failure in the summary.
+        if ($code -eq 3010) {
+            Add-Result $Label 'OK' 'exit 3010 (success; reboot required to finish)'
+            Write-Host "  Completed successfully, but a REBOOT is required to finish." -ForegroundColor Yellow
+            return
+        }
         Add-Result $Label 'OK' "exit $code"
     } else {
         Add-Result $Label 'Failed' "exit $code"
@@ -450,7 +490,9 @@ function Repair-SystemIntegrity {
     Write-Section "3. System integrity (DISM -> SFC)"
     # ORDER MATTERS: SFC repairs files *from* the component store. If the store is
     # corrupt, fix it FIRST with DISM, then run SFC. RestoreHealth needs internet.
-    Invoke-Native 'DISM RestoreHealth' 'DISM.exe' @('/Online','/Cleanup-Image','/RestoreHealth')
+    # DISM legitimately returns 3010 (success + reboot required) after servicing the
+    # component store -- accept it as success rather than crying failure.
+    Invoke-Native 'DISM RestoreHealth' 'DISM.exe' @('/Online','/Cleanup-Image','/RestoreHealth') -SuccessCodes @(0, 3010)
     Invoke-Native 'SFC scannow'        'sfc.exe'  @('/scannow')
 }
 
@@ -464,7 +506,16 @@ function Invoke-ChkdskScan {
         if (Confirm-Action "chkdsk C: /f /r (reboot-time)") {
             # 'Y' auto-answers the 'schedule at next restart?' prompt.
             'Y' | chkdsk.exe C: /f /r | Out-Null
-            Add-Result 'chkdsk /f /r (scheduled)' 'OK' 'runs at next reboot'
+            # Check the exit code like every other native call -- this used to report a
+            # flat 'OK' even if scheduling failed, promising a reboot-time check that
+            # would never happen. The Pending-reboot report below is the cross-check.
+            $code = $LASTEXITCODE
+            if ($code -eq 0) {
+                Add-Result 'chkdsk /f /r (scheduled)' 'OK' 'runs at next reboot'
+            } else {
+                Add-Result 'chkdsk /f /r (scheduled)' 'Partial' "chkdsk exit $code -- verify it was scheduled"
+                Write-Warning "chkdsk /f /r returned exit $code; confirm the reboot-time check was scheduled (see the pending-reboot report)."
+            }
         } else { Add-Result 'chkdsk /f /r (scheduled)' 'DryRun' }
     }
 }
@@ -517,7 +568,9 @@ function Clear-TempFiles {
         $dismArgs += '/ResetBase'
         Write-Host "  -DeepClean: adding /ResetBase (blocks uninstalling current updates)." -ForegroundColor Yellow
     }
-    Invoke-Native 'WinSxS component cleanup' 'DISM.exe' $dismArgs
+    # Same as RestoreHealth: component cleanup (especially with /ResetBase) commonly
+    # finishes with 3010 = success, reboot required.
+    Invoke-Native 'WinSxS component cleanup' 'DISM.exe' $dismArgs -SuccessCodes @(0, 3010)
 
     # Report reclaimed space (real runs only -- under -DryRun nothing was deleted).
     $afterGB = Get-FreeSpaceGB 'C'
@@ -659,7 +712,7 @@ function Sync-SystemClock {
 }
 
 function Clear-RecycleBinSafe {
-    Write-Section "Cleanup: Recycle Bin"
+    Write-Section "6b. Cleanup: Recycle Bin"
     # Opt-in: emptying the bin is real (recoverable) data loss, so never automatic.
     if (-not $EmptyRecycleBin) { Add-Result 'Recycle Bin' 'Skipped' 'not requested (-EmptyRecycleBin)'; return }
     if (-not (Confirm-Action "empty the Recycle Bin on all drives")) { Add-Result 'Recycle Bin' 'DryRun'; return }
@@ -681,7 +734,7 @@ function Clear-RecycleBinSafe {
 }
 
 function Reset-StoreCache {
-    Write-Section "Microsoft Store cache reset (wsreset)"
+    Write-Section "11. Microsoft Store cache reset (wsreset)"
     # Opt-in. wsreset clears the Store download cache -- the standard fix for Store/UWP
     # install/update failures. It has no silent mode and opens the Store when done, so
     # it's deliberately opt-in and we don't wait on it.
@@ -969,6 +1022,12 @@ function Find-EventIssues {
         else {
             $entry.Detail = "event IDs: $(@($entry.Events | ForEach-Object { $_.Id } | Sort-Object -Unique) -join ', ')"
         }
+        # Fallback so an issue NEVER renders a blank detail line. The app-crash branch
+        # above only names culprits from Application Error (id 1000); a category built
+        # purely from hangs (1002) or .NET Runtime events would otherwise show nothing.
+        if (-not $entry.Detail) {
+            $entry.Detail = "event IDs: $(@($entry.Events | ForEach-Object { $_.Id } | Sort-Object -Unique) -join ', ')"
+        }
         $script:Issues += $entry
     }
 
@@ -1153,7 +1212,9 @@ try {
 
     # ----- Summary -----
     Write-Section "Summary"
-    $script:Results | Format-Table -AutoSize
+    # -Wrap: the Detail column carries the actionable text (exit codes, skip reasons).
+    # Without it Format-Table truncates mid-sentence on a narrow console.
+    $script:Results | Format-Table -AutoSize -Wrap
     $failed = $script:Results | Where-Object { $_.Status -eq 'Failed' }
     if ($failed) {
         Write-Host "$($failed.Count) step(s) FAILED -- review above and the transcript." -ForegroundColor Red
@@ -1164,6 +1225,17 @@ try {
     Write-Host ("Elapsed: {0:mm}m {0:ss}s   Log: {1}" -f $elapsed, $logFile) -ForegroundColor DarkGray
 }
 finally {
-    # Always stop the transcript, even on Ctrl-C / unhandled error.
-    Stop-Transcript | Out-Null
+    # Always stop the transcript, even on Ctrl-C / unhandled error -- but only if WE
+    # started it (see the Start-Transcript guard above).
+    if ($script:TranscriptStarted) { Stop-Transcript | Out-Null }
+}
+
+# When we self-elevated, this is a BRAND-NEW console window that closes the instant the
+# script ends -- taking the entire summary and health report with it. Hold it open until
+# the user has read it. Gated on -Relaunched so an already-elevated or scheduled-task run
+# never blocks waiting on input.
+if ($Relaunched) {
+    Write-Host ""
+    Write-Host "Full log: $logFile" -ForegroundColor DarkGray
+    Read-Host "Press Enter to close this window"
 }
