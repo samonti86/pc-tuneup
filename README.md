@@ -105,7 +105,7 @@ pass their switch.
 | **1b** | **Safe auto-repair** — *opt-in* `-RepairIssues` | Acts on the event analysis: a targeted `winget repair` (falling back to `upgrade`) of a crashing app it can map to exactly one package. Skips anything ambiguous. |
 | **2** | **Windows Update** | Fully scripted when `PSWindowsUpdate` is installed; otherwise triggers detection and tells you to finish in Settings. |
 | **3** | **Integrity repair** — `DISM /RestoreHealth` → `sfc /scannow` | **Order matters:** SFC repairs system files *from* the component store, so the store is repaired first. Reversing this is the classic mistake. |
-| **4** | **Filesystem check** — `chkdsk C: /scan` | Online and non-destructive; no reboot. The full `/f /r` (which locks the volume and runs at boot) is opt-in via `-DeepClean`. |
+| **4** | **Filesystem check** — `chkdsk C: /scan` | Online and non-destructive; no reboot. The full `/f /r` (which locks the volume and runs at boot) is opt-in via `-DeepClean`, and the script **verifies with `chkntfs` that the boot-time check was actually scheduled** rather than trusting chkdsk's exit code — which returns `3` whether scheduling succeeded or failed. |
 | **5** | **Drive optimization** — `Optimize-Volume` | Media-aware: TRIM on SSDs, defrag on HDDs. Never hardcodes defrag, which would needlessly burn SSD write cycles. |
 | **6** | **Cleanup** — temp + WinSxS | Deletes temp items **older than 24 h** (recent ones may be in use by the running session) and runs `DISM /StartComponentCleanup`. Reports GB reclaimed. Skip with `-SkipCleanup`. |
 | **6b** | **Recycle Bin** — *opt-in* `-EmptyRecycleBin` | Opt-in because it destroys user-recoverable data. |
@@ -192,7 +192,7 @@ on a heuristic. That restraint is the design, not a missing feature.
 | `-SkipCleanup` | Skip the temp/WinSxS cleanup step. |
 | `-FullScan` | Defender `FullScan` instead of the default `QuickScan`. Much slower. |
 | `-EventDays N` | Days of Event Viewer history the analysis covers. Default `7`, range `1`–`365`. |
-| `-DeepClean` | **Opt-in.** Adds `chkdsk /f /r` (scheduled for next reboot) and DISM `/ResetBase`. `/ResetBase` **blocks uninstalling currently-installed updates**. |
+| `-DeepClean` | **Opt-in.** Adds `chkdsk /f /r` (scheduled for next reboot) and DISM `/ResetBase`. `/ResetBase` **blocks uninstalling currently-installed updates**. Note `/r` reads *every sector*: minutes on a small SSD, but **potentially many hours on a large spinning disk** — and the machine is unusable at the boot screen for the duration. Warn the owner before rebooting. |
 | `-FlushUpdateCache` | **Opt-in.** Stop `wuauserv`/`bits`, wipe `SoftwareDistribution\Download`, restart. Use when Windows Update is stuck. |
 | `-NetworkReset` | **Opt-in.** `netsh winsock reset` + `netsh int ip reset`. **Requires a reboot**; may disrupt VPN/proxy config. |
 | `-RepairIssues` | **Opt-in.** Attempt the safe auto-repairs the analysis flags. Alias: `-RepairCrashLoops`. |
@@ -342,6 +342,19 @@ Install-Module PSWindowsUpdate -Scope CurrentUser
 
 **A step says `Failed` — did the rest of the run abort?**
 No. Steps are isolated; a failure is recorded and the run continues to the summary.
+
+**Did the boot-time `chkdsk /f /r` actually run?**
+Check it, don't assume — a fast reboot usually means nothing was queued. Before rebooting,
+`chkntfs C:` should say *"Chkdsk has been scheduled manually to run on next reboot."*
+Afterwards, autochk writes its full output to the **Application** log as
+`Microsoft-Windows-Wininit` event **1001**:
+
+```powershell
+Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='Microsoft-Windows-Wininit'} -MaxEvents 5 |
+    Select-Object TimeCreated, Id
+```
+
+No 1001 event means it never ran. Cancel a pending check with `chkntfs /x C:`.
 
 **It says a reboot is pending**
 `chkdsk /f /r`, DISM servicing, and `-NetworkReset` all defer their real work to the

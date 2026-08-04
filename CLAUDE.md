@@ -217,6 +217,45 @@ Origin research (the verified command spec this script implements) lives in
       (Mail/Calendar/People sync DB) reporting "multiple threads illegally using the same
       database session" -- a Microsoft-internal threading defect, benign, not user-fixable.
       Verified: parse OK 5.1, PSSA clean, AST-loaded smoke test of all 3 fixes.
+- [x] chkdsk /f /r SCHEDULING ACTUALLY FIXED (2026-08-04, user-driven: they want -DeepClean
+      usable on OTHER people's machines -- friends' PCs, possible spinning disks where /r's
+      bad-sector surface scan is the whole point -- so "fails honestly" wasn't good enough).
+      Root cause, found by empirical elimination on the live box:
+      (1) FIRST HYPOTHESIS WRONG: guessed the output redirection (`| Out-Null`) suppressed
+      chkdsk's "schedule at next restart? (Y/N)" prompt. Removing it DID restore the prompt --
+      but chkdsk then asked THREE TIMES and aborted, still scheduling nothing. So redirection
+      was a red herring; the piped answer was never consumed.
+      (2) ACTUAL CAUSE: a PowerShell pipeline does NOT satisfy that prompt. `'Y' | chkdsk.exe
+      C: /f /r` leaves it unanswered (3 re-prompts, nothing scheduled). `cmd.exe /c
+      "echo y|chkdsk C: /f /r"` answers it correctly -> "This volume will be checked the next
+      time the system restarts" + chkntfs confirms "scheduled manually to run on next reboot".
+      Fix = let CMD do the piping. DO NOT "simplify" it back to a native PS pipe.
+      (3) BONUS TRAP: chkdsk returns EXIT 3 EVEN WHEN SCHEDULING SUCCEEDS. Measured exit 3
+      both when nothing was scheduled AND when chkntfs then confirmed it was. The exit code
+      carries zero signal here -- so the code now IGNORES it entirely and reports purely on
+      the chkntfs-verified end state (Partial if chkntfs itself returns nothing). This is the
+      strongest vindication yet of the project's verify-the-end-state-over-the-return-code rule.
+      Deliberately NOT done: writing BootExecute (`autocheck autochk /r \??\C:`) directly. It
+      was the fallback plan for a true /r if cmd failed, but the safe documented path works,
+      so no registry surgery in the boot path -- holds the project's conservative line.
+      README: step-4 row documents the chkntfs verification; new FAQ entry "Did the boot-time
+      chkdsk actually run?" (chkntfs before, Wininit 1001 in the Application log after,
+      `chkntfs /x C:` to cancel); -DeepClean row warns /r reads every sector and can take
+      HOURS on a large spinning disk with the machine unusable at the boot screen.
+- [x] Windows Search root-caused (2026-08-04): WSearch has crashed ~1x/day for the FULL 60-day
+      log retention, always 21-22s after a system start, never mid-session -- a deterministic
+      STARTUP RACE (7023 "A specified logon session does not exist"), not index corruption.
+      That is why the user's repeated index rebuilds never stuck: a rebuild cannot fix a
+      timing problem. Suggested `sc.exe config WSearch start= delayed-auto` as the reversible
+      mitigation. SEPARATELY found a stale crawl scope pointing at `file:///E:\[38115ef8-...]`
+      (drive absent; only C: and an empty D: exist) present in BOTH WorkingSetRules AND
+      DefaultRules -- DefaultRules is the baseline re-applied on every rebuild, so it outlived
+      every rebuild. User removed it via Indexing Options (it renders as a GUID folder marked
+      "not available" because the volume is unmounted). NOTE: hypothesis that E:\ CAUSED the
+      boot crash was DISPROVEN -- its error (id 1019) fired once in 30 days, during the
+      rebuild, never at a boot crash. Two independent problems, not one.
+      Also disproven this session: ESENT 902 x66 is Unistore (Mail/Calendar/People sync DB)
+      reporting a Microsoft-internal threading defect -- unrelated to Search, not user-fixable.
 - [ ] Test on a Windows 10 machine to confirm cross-version behavior
 - [ ] Optional: add to command-center projects-index
 - [ ] Optional: scheduled-task wrapper for monthly auto-run

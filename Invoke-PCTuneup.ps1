@@ -513,17 +513,22 @@ function Invoke-ChkdskScan {
     if ($DeepClean) {
         Write-Host "  -DeepClean: scheduling full chkdsk /f /r at next reboot..." -ForegroundColor Yellow
         if (Confirm-Action "chkdsk C: /f /r (reboot-time)") {
-            # 'Y' auto-answers the 'schedule at next restart?' prompt. CAPTURE the output
-            # rather than discarding it: when this doesn't work, chkdsk's own text is the
-            # only explanation available, and piping it to Out-Null threw that evidence
-            # away -- leaving a bare "exit 3" with nothing to diagnose it from.
-            $out  = ('Y' | chkdsk.exe C: /f /r 2>&1 | Out-String)
+            # Let CMD do the piping -- NOT PowerShell. chkdsk's "schedule at next restart?
+            # (Y/N)" prompt is not satisfied by a PowerShell pipeline: `'Y' | chkdsk.exe`
+            # leaves it unanswered, so chkdsk re-prompts three times and schedules NOTHING.
+            # `cmd /c "echo y|chkdsk ..."` answers it correctly. Verified on Win11 26200:
+            # PS pipe -> "C: is not dirty" (nothing scheduled); cmd echo -> "Chkdsk has been
+            # scheduled manually to run on next reboot". Do not "simplify" this back to a
+            # native PowerShell pipe.
+            cmd.exe /c "echo y|chkdsk C: /f /r"
             $code = $LASTEXITCODE
-            if ($out.Trim()) { Write-Host ('  ' + ($out.Trim() -replace "`r?`n", "`n  ")) -ForegroundColor DarkGray }
 
-            # Don't INFER the outcome from the exit code -- VERIFY it. chkntfs reports
-            # whether autochk will actually run on this volume at next boot, which is the
-            # only thing that matters here. An exit code is a claim; this is the end state.
+            # IGNORE THE EXIT CODE -- it is genuinely meaningless here. chkdsk returns 3
+            # ("could not check the disk") whether scheduling SUCCEEDED or failed: measured
+            # exit 3 both when nothing was scheduled and when chkntfs then confirmed
+            # "scheduled manually to run on next reboot". So verify the END STATE instead.
+            # chkntfs reports whether autochk will really run on this volume at next boot,
+            # which is the only fact that matters. An exit code is a claim; this is reality.
             $verify = ''
             try { $verify = (& chkntfs.exe C: 2>&1 | Out-String) }
             catch { Write-Verbose "chkntfs query failed: $($_.Exception.Message)" }
@@ -532,14 +537,19 @@ function Invoke-ChkdskScan {
 
             if ($scheduled) {
                 Write-Host "  Verified: a disk check IS scheduled for the next reboot." -ForegroundColor Green
-                Add-Result 'chkdsk /f /r (scheduled)' 'OK' "verified via chkntfs (chkdsk exit $code)"
-            } elseif ($code -eq 0) {
-                Add-Result 'chkdsk /f /r (scheduled)' 'OK' 'runs at next reboot'
+                Write-Host "  Note: /r reads every sector -- this can take a long time at boot on a large disk." -ForegroundColor Yellow
+                Add-Result 'chkdsk /f /r (scheduled)' 'OK' "verified via chkntfs (chkdsk exit $code is not meaningful)"
+            } elseif (-not $verify.Trim()) {
+                # chkntfs itself gave us nothing, so we genuinely don't know either way.
+                # Say so rather than guessing from the exit code.
+                Add-Result 'chkdsk /f /r (scheduled)' 'Partial' 'could not verify with chkntfs'
+                Write-Warning "Could not confirm whether the boot-time check was scheduled (chkntfs returned nothing)."
             } else {
-                Add-Result 'chkdsk /f /r (scheduled)' 'Failed' "chkdsk exit $code; chkntfs shows NO scheduled check"
-                Write-Warning "chkdsk /f /r exited $code and chkntfs reports no scheduled check -- it was NOT scheduled."
+                Add-Result 'chkdsk /f /r (scheduled)' 'Failed' 'chkntfs shows NO scheduled check'
+                Write-Warning "chkntfs reports no scheduled check -- the boot-time chkdsk was NOT scheduled."
                 Write-Host "  To schedule it by hand, run this in an elevated prompt and answer Y:" -ForegroundColor Yellow
                 Write-Host "      chkdsk C: /f /r" -ForegroundColor Yellow
+                Write-Host "  (To cancel a scheduled check later:  chkntfs /x C:)" -ForegroundColor DarkGray
             }
         } else { Add-Result 'chkdsk /f /r (scheduled)' 'DryRun' }
     }
