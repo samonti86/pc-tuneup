@@ -85,9 +85,10 @@ local scripts. The flag applies to that one invocation only — it does not chan
 machine setting. If your policy already allows local scripts (`RemoteSigned`), you can
 just run `.\Invoke-PCTuneup.ps1`. The UAC relaunch re-passes the flag automatically.
 
-**How long does it take?** Typically **20–45 minutes** for a full run. `DISM
-/RestoreHealth` and `sfc /scannow` are the slow parts, and a Defender scan adds more.
-`-ReportOnly` finishes in about a minute or two.
+**How long does it take?** Typically **20–45 minutes** for the default routine. `DISM
+/RestoreHealth` and `sfc /scannow` are the slow parts, and a Defender scan adds more. A
+full `-DeepClean` pass (which adds DISM `/ResetBase`) has been measured at **just over an
+hour** on an NVMe machine — budget accordingly. `-ReportOnly` finishes in a minute or two.
 
 ---
 

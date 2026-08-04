@@ -467,8 +467,17 @@ function Invoke-OSUpdate {
         if (-not (Confirm-Action "Install-WindowsUpdate -AcceptAll")) { Add-Result 'Windows Update' 'DryRun'; return }
         try {
             Import-Module PSWindowsUpdate -ErrorAction Stop
-            Install-WindowsUpdate -AcceptAll -IgnoreReboot -ErrorAction Stop
-            Add-Result 'Windows Update' 'OK' 'via PSWindowsUpdate'
+            # Capture the result so the summary can distinguish "nothing was available"
+            # from "installed 5 updates". Previously both rendered as a bare 'OK' with an
+            # empty section body -- no way to tell whether it had actually done anything.
+            $wu = @(Install-WindowsUpdate -AcceptAll -IgnoreReboot -ErrorAction Stop)
+            if ($wu.Count -gt 0) {
+                $wu | Format-Table -AutoSize | Out-String | Write-Host
+                Add-Result 'Windows Update' 'OK' "via PSWindowsUpdate; $($wu.Count) update(s)"
+            } else {
+                Write-Host "  No applicable updates found -- already current." -ForegroundColor Green
+                Add-Result 'Windows Update' 'OK' 'via PSWindowsUpdate; none available'
+            }
         } catch {
             Add-Result 'Windows Update' 'Failed' $_.Exception.Message
             Write-Warning "PSWindowsUpdate failed: $($_.Exception.Message)"
@@ -504,17 +513,33 @@ function Invoke-ChkdskScan {
     if ($DeepClean) {
         Write-Host "  -DeepClean: scheduling full chkdsk /f /r at next reboot..." -ForegroundColor Yellow
         if (Confirm-Action "chkdsk C: /f /r (reboot-time)") {
-            # 'Y' auto-answers the 'schedule at next restart?' prompt.
-            'Y' | chkdsk.exe C: /f /r | Out-Null
-            # Check the exit code like every other native call -- this used to report a
-            # flat 'OK' even if scheduling failed, promising a reboot-time check that
-            # would never happen. The Pending-reboot report below is the cross-check.
+            # 'Y' auto-answers the 'schedule at next restart?' prompt. CAPTURE the output
+            # rather than discarding it: when this doesn't work, chkdsk's own text is the
+            # only explanation available, and piping it to Out-Null threw that evidence
+            # away -- leaving a bare "exit 3" with nothing to diagnose it from.
+            $out  = ('Y' | chkdsk.exe C: /f /r 2>&1 | Out-String)
             $code = $LASTEXITCODE
-            if ($code -eq 0) {
+            if ($out.Trim()) { Write-Host ('  ' + ($out.Trim() -replace "`r?`n", "`n  ")) -ForegroundColor DarkGray }
+
+            # Don't INFER the outcome from the exit code -- VERIFY it. chkntfs reports
+            # whether autochk will actually run on this volume at next boot, which is the
+            # only thing that matters here. An exit code is a claim; this is the end state.
+            $verify = ''
+            try { $verify = (& chkntfs.exe C: 2>&1 | Out-String) }
+            catch { Write-Verbose "chkntfs query failed: $($_.Exception.Message)" }
+            $scheduled = ($verify -match 'scheduled') -or
+                         ($verify -match 'is dirty' -and $verify -notmatch 'not dirty')
+
+            if ($scheduled) {
+                Write-Host "  Verified: a disk check IS scheduled for the next reboot." -ForegroundColor Green
+                Add-Result 'chkdsk /f /r (scheduled)' 'OK' "verified via chkntfs (chkdsk exit $code)"
+            } elseif ($code -eq 0) {
                 Add-Result 'chkdsk /f /r (scheduled)' 'OK' 'runs at next reboot'
             } else {
-                Add-Result 'chkdsk /f /r (scheduled)' 'Partial' "chkdsk exit $code -- verify it was scheduled"
-                Write-Warning "chkdsk /f /r returned exit $code; confirm the reboot-time check was scheduled (see the pending-reboot report)."
+                Add-Result 'chkdsk /f /r (scheduled)' 'Failed' "chkdsk exit $code; chkntfs shows NO scheduled check"
+                Write-Warning "chkdsk /f /r exited $code and chkntfs reports no scheduled check -- it was NOT scheduled."
+                Write-Host "  To schedule it by hand, run this in an elevated prompt and answer Y:" -ForegroundColor Yellow
+                Write-Host "      chkdsk C: /f /r" -ForegroundColor Yellow
             }
         } else { Add-Result 'chkdsk /f /r (scheduled)' 'DryRun' }
     }
@@ -1074,8 +1099,19 @@ function Get-HealthReport {
 function Get-StartupAudit {
     Write-Section "Report: Startup programs"
     # Get-CimInstance, not the deprecated Get-WmiObject (removed in PS7).
-    Get-CimInstance Win32_StartupCommand |
-        Select-Object Name, Command, Location | Format-Table -AutoSize -Wrap
+    #
+    # Win32_StartupCommand.Location is either a Startup-folder name or a FULL registry
+    # path -- and the per-user HKU paths embed a raw SID, which is ~50 characters. Under
+    # Format-Table -AutoSize -Wrap that starved the column down to ~8 chars and wrapped it
+    # ONE CHARACTER PER LINE, turning the whole report into unreadable confetti. Collapse
+    # the path to hive + leaf key and clip the command so the table stays legible.
+    Get-CimInstance Win32_StartupCommand | ForEach-Object {
+        $loc = "$($_.Location)"
+        if ($loc -match '^(HK[A-Z_]+)\\.*\\([^\\]+)$') { $loc = "$($Matches[1])\...\$($Matches[2])" }
+        $cmd = "$($_.Command)"
+        if ($cmd.Length -gt 70) { $cmd = $cmd.Substring(0, 67) + '...' }
+        [pscustomobject]@{ Name = $_.Name; Location = $loc; Command = $cmd }
+    } | Format-Table -AutoSize
     Add-Result 'Startup audit' 'OK'
 }
 
@@ -1171,6 +1207,11 @@ function Get-NetworkReport {
 # MAIN
 # ===========================================================================
 $startTime = Get-Date
+# Time the run with a MONOTONIC stopwatch rather than subtracting Get-Date values. This
+# script resyncs the system clock itself (step 10), and NTP/DST corrections can move
+# wall-clock time mid-run -- which would silently corrupt the elapsed figure. Same
+# distinction as CLOCK_MONOTONIC vs CLOCK_REALTIME on Linux.
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 Write-Host ""
 Write-Host "PC Tuneup -- $(if($DryRun){'[DRY RUN] '})$(if($ReportOnly){'[REPORT ONLY] '})starting $startTime" -ForegroundColor Magenta
 Write-Host "Log: $logFile" -ForegroundColor DarkGray
@@ -1221,8 +1262,12 @@ try {
     } else {
         Write-Host "All steps completed without hard failures." -ForegroundColor Green
     }
-    $elapsed = (Get-Date) - $startTime
-    Write-Host ("Elapsed: {0:mm}m {0:ss}s   Log: {1}" -f $elapsed, $logFile) -ForegroundColor DarkGray
+    # Format hours EXPLICITLY. '{0:mm}' is the minutes-within-the-hour component, so it
+    # silently drops whole hours: a real 1h01m59s run printed as "01m 59s". A -DeepClean
+    # pass (DISM /ResetBase + SFC + a full Windows Update scan) genuinely can exceed an hour.
+    $elapsed = $stopwatch.Elapsed
+    $elapsedTxt = '{0:00}h {1:00}m {2:00}s' -f [math]::Floor($elapsed.TotalHours), $elapsed.Minutes, $elapsed.Seconds
+    Write-Host ("Elapsed: $elapsedTxt   Log: $logFile") -ForegroundColor DarkGray
 }
 finally {
     # Always stop the transcript, even on Ctrl-C / unhandled error -- but only if WE

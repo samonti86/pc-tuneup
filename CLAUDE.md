@@ -183,6 +183,40 @@ Origin research (the verified command spec this script implements) lives in
       review before pasting into an issue), safety model + explicit "will not do" list,
       11-entry FAQ, scheduled-task recipe, compatibility (incl. PS7 Checkpoint-Computer
       caveat + non-English parsing caveat), dev/sanity-gate section.
+- [x] FIRST FULL ELEVATED RUN OF THE PROOFREAD BUILD (2026-08-04, tuneup-2026-08-03-160954):
+      `-DeepClean -FlushUpdateCache -NetworkReset -RepairIssues -ResetStore` on Win11 26200.
+      Validated in production: 6b/11 numbering, DISM 3010 handling, netsh Partial classifier,
+      Defender engine-inactive skip, restore point, 10.64 GB reclaimed by /ResetBase. The new
+      chkdsk exit-code check EARNED ITS KEEP -- caught `chkdsk /f /r` exiting 3 (would have
+      been a silent false 'OK' before). 3 new bugs found from the real output + fixed:
+      (1) ELAPSED TIME DROPPED WHOLE HOURS. '{0:mm}' is the minutes-WITHIN-HOUR component, so
+      the 62-minute run printed "Elapsed: 01m 59s". Confirmed by log file span (16:09:54 ->
+      17:11:54 = 62 min) and by formatting a 3719s TimeSpan. Now formats hours explicitly AND
+      times with a MONOTONIC [Diagnostics.Stopwatch] instead of Get-Date subtraction -- the
+      script resyncs the clock itself at step 10, so wall-clock deltas are self-corruptible
+      (CLOCK_MONOTONIC vs CLOCK_REALTIME). NOTE: investigated whether the clock actually
+      jumped mid-run -- it did NOT (Kernel-General id 1 shows only a 2ms delta at 17:51,
+      after the run). The hypothesis was wrong; the run really did take 62 min.
+      (2) chkdsk /f /r piped its output to Out-Null, discarding the ONLY evidence of why it
+      exited 3. Now captures + prints it, and -- more importantly -- VERIFIES the end state
+      with `chkntfs C:` instead of inferring from the exit code (an exit code is a claim;
+      chkntfs is the actual scheduled state). Reports Failed + the manual command when no
+      check is really scheduled.
+      (3) STARTUP AUDIT WAS UNREADABLE: Win32_StartupCommand.Location embeds a ~50-char raw
+      SID for HKU entries; Format-Table -AutoSize -Wrap starved the column to ~8 chars and
+      wrapped it ONE CHARACTER PER LINE. Now collapses to hive+leaf ('HKU\...\Run') and clips
+      the command; verified against this box's 12 startup entries.
+      Also: Windows Update now reports update COUNT ('none available' vs 'N update(s)') --
+      previously a no-op and a real install both rendered as a bare 'OK' with an empty body.
+      README timing corrected (a -DeepClean pass measured at just over an hour, not 20-45 min).
+      Machine findings (not script bugs): WSearch crash-loop is REAL and actionable --
+      Microsoft-Windows-Search 3602/7042 x8 each ("Recovery phase failed", 0x80040d23,
+      "please recreate the index") + WSearch 7031/7023 x12 ("A specified logon session does
+      not exist") = corrupt SystemIndex catalog; the tool's own advice (rebuild the index) is
+      the right fix. ESENT 902 x66 is NOT search-related (hypothesis was wrong): it's Unistore
+      (Mail/Calendar/People sync DB) reporting "multiple threads illegally using the same
+      database session" -- a Microsoft-internal threading defect, benign, not user-fixable.
+      Verified: parse OK 5.1, PSSA clean, AST-loaded smoke test of all 3 fixes.
 - [ ] Test on a Windows 10 machine to confirm cross-version behavior
 - [ ] Optional: add to command-center projects-index
 - [ ] Optional: scheduled-task wrapper for monthly auto-run
