@@ -106,7 +106,7 @@ pass their switch.
 | **2** | **Windows Update** | Fully scripted when `PSWindowsUpdate` is installed; otherwise triggers detection and tells you to finish in Settings. |
 | **3** | **Integrity repair** — `DISM /RestoreHealth` → `sfc /scannow` | **Order matters:** SFC repairs system files *from* the component store, so the store is repaired first. Reversing this is the classic mistake. |
 | **4** | **Filesystem check** — `chkdsk C: /scan` | Online and non-destructive; no reboot. The full `/f /r` (which locks the volume and runs at boot) is opt-in via `-DeepClean`, and the script **verifies with `chkntfs` that the boot-time check was actually scheduled** rather than trusting chkdsk's exit code — which returns `3` whether scheduling succeeded or failed. |
-| **5** | **Drive optimization** — `Optimize-Volume` | Media-aware: TRIM on SSDs, defrag on HDDs. Never hardcodes defrag, which would needlessly burn SSD write cycles. |
+| **5** | **Drive optimization** — `Optimize-Volume` | Media-aware: TRIM on SSDs, defrag on HDDs. Never hardcodes defrag, which would needlessly burn SSD write cycles. **System drive only by default** — a defrag pass on a large spinning data drive can run for hours; add `-OptimizeAllDrives` to include the rest. Other fixed drives are still listed as `Skipped` in the summary, never silently ignored. |
 | **6** | **Cleanup** — temp + WinSxS | Deletes temp items **older than 24 h** (recent ones may be in use by the running session) and runs `DISM /StartComponentCleanup`. Reports GB reclaimed. Skip with `-SkipCleanup`. |
 | **6b** | **Recycle Bin** — *opt-in* `-EmptyRecycleBin` | Opt-in because it destroys user-recoverable data. |
 | **7** | **Update cache reset** — *opt-in* `-FlushUpdateCache` | Stops `wuauserv`/`bits`, wipes `SoftwareDistribution\Download`, restarts them. For when Windows Update is stuck. |
@@ -122,7 +122,7 @@ These are **read-only** and run on every invocation, including `-DryRun` and
 
 | Report | Tells you |
 |---|---|
-| **Disk health** | Per-physical-disk health/operational status, plus wear %, reboot-error counts, temperature and power-on hours where the drive exposes them. |
+| **Disk health** | Per-physical-disk health/operational status, plus wear %, reboot-error counts, temperature and power-on hours where the drive exposes them. If the Storage WMI provider is broken on the machine (it happens), falls back to the classic `Win32_DiskDrive` view — model, size, interface and the drive's own SMART `Pred Fail` verdict — and reports `Partial` rather than failing. |
 | **Disk space** | Free space per fixed drive, flagged `LOW` under 10 % and `watch` under 15 %. Low space causes update failures and paging thrash. |
 | **Filesystem dirty bit** | Whether Windows has flagged a volume for an automatic `chkdsk` at next boot. |
 | **WinSxS component store** | Real on-disk size of the component store and whether Windows itself recommends a cleanup. |
@@ -166,7 +166,19 @@ issue is reported with a **severity**, the **specific culprits**, **recency**, a
   errors, hardware faults (WHEA), unexpected shutdowns.
 - **Medium** — app crashes, service crashes, Volume Shadow Copy/backup, Windows Update.
 - **Low** — usually-benign noise (DCOM timeouts, TPM, certificate enrollment,
-  Hyper-V/WSL networking), shown only once it crosses a volume threshold.
+  Hyper-V/WSL networking, `.NET` app error logs), shown only once it crosses a volume
+  threshold.
+
+**A crash is not an error log.** `.NET Runtime` is a *shared* event source: the CLR uses
+it to report a fatal unhandled exception (IDs 1023/1026/1027 — a genuine crash), but so
+does any ASP.NET Core app that enables EventLog logging without setting its own
+`SourceName`. Those apps write their normal `ILogger` output there — a failed HTTP call
+to an upstream API is not a crash — under *their own* event IDs, which collide freely
+with Windows' own. The analysis splits the two: real CLR failures classify as **App
+crashes** (auto-repairable), everything else as **App error logs (.NET)**, Low severity,
+with advice pointing at the app's configuration instead of Windows repair tools. Volume
+here usually means one misconfigured setting (a wrong upstream URL or API key, or a
+third-party endpoint that's been retired) rather than a sick machine.
 
 **Recency matters.** Every issue carries first-seen and last-seen timestamps and a
 "last 24 h" count, and issues sort by severity → recently-active → volume. That's how
@@ -198,6 +210,7 @@ on a heuristic. That restraint is the design, not a missing feature.
 | `-RepairIssues` | **Opt-in.** Attempt the safe auto-repairs the analysis flags. Alias: `-RepairCrashLoops`. |
 | `-EmptyRecycleBin` | **Opt-in.** Empty the Recycle Bin on all drives. |
 | `-ResetStore` | **Opt-in.** Clear the Microsoft Store cache (`wsreset`). Opens the Store window when done. |
+| `-OptimizeAllDrives` | **Opt-in.** Optimize every fixed drive in step 5, not just the system drive. Off by default because a defrag pass on a large spinning data drive can run for hours. |
 
 Standard PowerShell common parameters (`-Verbose`, `-ErrorAction`, …) work too, and are
 forwarded correctly across the UAC relaunch.

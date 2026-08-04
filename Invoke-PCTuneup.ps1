@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Routine maintenance for Windows 10 (1809+) and Windows 11.
@@ -58,6 +59,12 @@
     Clear the Microsoft Store cache (wsreset). Opt-in; useful for Store/UWP update
     errors (e.g. 0x80073D02). Note: wsreset opens the Store window when it finishes.
 
+.PARAMETER OptimizeAllDrives
+    Optimize EVERY fixed drive in step 5, not just the system drive. Opt-in because a
+    defrag pass on a large spinning data drive can run for HOURS and would dominate a
+    routine that otherwise finishes in minutes. Non-system drives are reported as
+    Skipped without this switch, never silently ignored.
+
 .PARAMETER RepairIssues
     Attempt the SAFE auto-repairs the health analysis flags. In practice that means a
     targeted winget repair (falling back to upgrade) of crashing apps it can map to a
@@ -98,6 +105,7 @@ param(
     [switch]$RepairIssues,
     [switch]$EmptyRecycleBin,
     [switch]$ResetStore,
+    [switch]$OptimizeAllDrives,
     [ValidateRange(1, 365)]
     [int]$EventDays = 7,
     # INTERNAL -- set automatically by the UAC relaunch below, not meant to be passed
@@ -237,6 +245,44 @@ function Convert-ExceptionCode {
     return "0x$norm"
 }
 
+# Event-log insertion strings are NOT guaranteed to be short, single-line, or even an
+# app name. A .NET app logging through Microsoft.Extensions.Logging writes its ENTIRE
+# multi-line message -- stack traces included -- as property [0] under the shared
+# '.NET Runtime' source. Collapse to one line and clip, so one noisy app can't dump 40
+# lines of stack trace into the report body and the summary table.
+function Format-EventToken {
+    param([string]$Text, [int]$Max = 48)
+    if (-not $Text) { return '' }
+    $t = (($Text -replace '[\r\n\t]+', ' ') -replace '\s{2,}', ' ').Trim()
+    if ($t.Length -gt $Max) { return $t.Substring(0, [Math]::Max(1, $Max - 3)) + '...' }
+    return $t
+}
+
+# Guard for anything about to be treated as a FILE NAME. On Windows PowerShell 5.1
+# (.NET Framework) [IO.Path]::GetFileNameWithoutExtension() THROWS "Illegal characters
+# in path" on control chars / < > " |; .NET Core silently accepts them. That asymmetry
+# is exactly why this class of bug survives PS7 testing and only detonates on 5.1 --
+# the shipping target. GetInvalidFileNameChars() is a superset of what the API rejects,
+# so this errs toward "not a file name" and the caller safely does nothing.
+function Test-PlausibleFileName {
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    if ($Name.Length -gt 128) { return $false }
+    return ($Name.IndexOfAny([System.IO.Path]::GetInvalidFileNameChars()) -lt 0)
+}
+
+# Service Control Manager insertion strings put the service name at [0] -- EXCEPT on the
+# two timeout events, where [0] is the timeout in MILLISECONDS and the service is at [1]:
+#   7009  "A timeout was reached (%1 milliseconds) while waiting for the %2 service..."
+#   7011  "A timeout (%1 ms) was reached while waiting for a transaction response from %2"
+# Reading [0] blindly names the culprit "30000".
+function Get-EventServiceName {
+    param($EventRecord)
+    $idx = if ($EventRecord.Id -eq 7009 -or $EventRecord.Id -eq 7011) { 1 } else { 0 }
+    if ($EventRecord.Properties.Count -le $idx) { $idx = 0 }
+    return [string]$EventRecord.Properties[$idx].Value
+}
+
 # Parse `winget list` text output by header-column offsets and return the single Id
 # if exactly one package matched. Returns $null on zero/ambiguous/locale-mismatch --
 # the caller treats $null as "don't touch anything" (safe by default).
@@ -275,7 +321,15 @@ function Resolve-WingetId {
         try { $term = (Get-Item $Path -ErrorAction Stop).VersionInfo.ProductName }
         catch { Write-Verbose "ProductName lookup failed for '$Path'; will fall back to the exe base name." }
     }
-    if (-not $term) { $term = [System.IO.Path]::GetFileNameWithoutExtension($App) }
+    if (-not $term) {
+        # Only if $App actually looks like a file name -- see Test-PlausibleFileName.
+        # A caller can hand us an arbitrary event-log string, and on 5.1 that throws.
+        if (-not (Test-PlausibleFileName $App)) {
+            Write-Verbose "Skipping '$(Format-EventToken $App)': not a plausible executable name."
+            return $null
+        }
+        $term = [System.IO.Path]::GetFileNameWithoutExtension($App)
+    }
     if (-not $term) { return $null }
 
     if (Test-CommandExists 'Get-WinGetPackage') {
@@ -559,16 +613,76 @@ function Optimize-Drives {
     Write-Section "5. Drive optimization (TRIM / defrag)"
     # Optimize-Volume is media-aware: TRIM on SSD, defrag on HDD. Never hardcode
     # -Defrag (would needlessly burn SSD write cycles).
-    $volumes = Get-Volume | Where-Object { $_.DriveLetter -and $_.DriveType -eq 'Fixed' }
-    foreach ($v in $volumes) {
-        $label = "Optimize $($v.DriveLetter):"
+    #
+    # SYSTEM DRIVE ONLY by default. A defrag pass on a large spinning data drive can run
+    # for HOURS -- a real test box had 33 TB and 22 TB fixed volumes attached -- which
+    # would dominate a routine that otherwise finishes in ~15 minutes, and that is not an
+    # acceptable surprise on someone else's PC. The system drive is where optimization
+    # actually pays off. -OptimizeAllDrives opts into the rest.
+    #
+    # Note the system drive comes from an env var, so the DEFAULT path needs no WMI at
+    # all. That matters: Get-Volume rides the Storage WMI provider, which is not
+    # dependable everywhere -- on a live Win10 22H2 box it errored with "Invalid property"
+    # and returned nothing. The old loop then had nothing to iterate, added NO result, and
+    # the step VANISHED from the summary. A silent no-op is the one outcome this tool must
+    # never produce.
+    $sysDrive = "$env:SystemDrive".TrimEnd(':')
+    $targets  = @($sysDrive)
+
+    # Enumerate the other fixed drives so they can be REPORTED as skipped (and optimized
+    # under -OptimizeAllDrives). Best-effort: failure here must not cost us the system drive.
+    $others = @()
+    try {
+        $others = @(Get-Volume -ErrorAction Stop |
+            Where-Object { $_.DriveLetter -and $_.DriveType -eq 'Fixed' } |
+            ForEach-Object { [string]$_.DriveLetter })
+    } catch {
+        $why = ($_.Exception.Message -split "`r?`n")[0]
+        Write-Warning "Get-Volume failed ($why) -- falling back to Win32_LogicalDisk."
+    }
+    if (-not $others) {
+        # DriveType=3 is a local fixed disk, the same set Get-Volume's 'Fixed' selects.
+        $others = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.DeviceID.TrimEnd(':') })
+    }
+    $others = @($others | Where-Object { $_ -and $_ -ne $sysDrive })
+
+    if ($OptimizeAllDrives) {
+        Write-Host "  -OptimizeAllDrives: including non-system fixed drives (this can take hours on large HDDs)." -ForegroundColor Yellow
+        $targets += $others
+        $others = @()
+    } elseif ($others) {
+        $list = ($others | ForEach-Object { "$($_):" }) -join ', '
+        Write-Host "  System drive only. Skipping $list -- use -OptimizeAllDrives to include them." -ForegroundColor DarkGray
+    }
+
+    foreach ($dl in $targets) {
+        $label = "Optimize ${dl}:"
         if (-not (Confirm-Action $label)) { Add-Result $label 'DryRun'; continue }
         try {
-            Optimize-Volume -DriveLetter $v.DriveLetter -Verbose -ErrorAction Stop
+            Optimize-Volume -DriveLetter $dl -Verbose -ErrorAction Stop
             Add-Result $label 'OK'
         } catch {
-            Add-Result $label 'Failed' $_.Exception.Message
+            # Optimize-Volume is backed by the same provider that just broke the
+            # enumeration. defrag.exe is the in-box equivalent and does NOT go through
+            # it; /O means "do the right operation for this media type" -- i.e. TRIM on
+            # an SSD, defrag on an HDD, exactly what Optimize-Volume does by default.
+            $why = ($_.Exception.Message -split "`r?`n")[0]
+            Write-Warning "Optimize-Volume failed on ${dl}: ($why) -- retrying with defrag.exe /O."
+            defrag.exe "${dl}:" /O
+            if ($LASTEXITCODE -eq 0) {
+                Add-Result $label 'OK' 'via defrag.exe /O (Storage provider unavailable)'
+            } else {
+                Add-Result $label 'Failed' "Optimize-Volume + defrag.exe (exit $LASTEXITCODE) both failed"
+            }
         }
+    }
+
+    # Recorded AFTER the loop so the summary leads with the drive that was actually
+    # optimized. Skipped drives still get a row -- what we did NOT touch is part of an
+    # honest report, and $others is empty under -OptimizeAllDrives.
+    foreach ($dl in $others) {
+        Add-Result "Optimize ${dl}:" 'Skipped' 'non-system drive (-OptimizeAllDrives to include)'
     }
 }
 
@@ -791,11 +905,45 @@ function Reset-StoreCache {
 
 function Get-DiskHealthReport {
     Write-Section "Report: Disk health"
-    Get-PhysicalDisk | Select-Object FriendlyName, MediaType, HealthStatus, OperationalStatus | Format-Table -AutoSize
+    # The Storage WMI provider (root\Microsoft\Windows\Storage) is NOT dependable on every
+    # box. On a live Win10 22H2 machine Get-PhysicalDisk died with "Invalid property"
+    # (CimException 0x80041031) -- and note the failure surfaced from the ENUMERATOR
+    # ("Exception calling MoveNext"), i.e. a terminating error mid-pipeline that
+    # -ErrorAction SilentlyContinue does not suppress. Unguarded, that failed the step.
+    # Win32_DiskDrive lives in the classic CIMv2 provider and is unaffected, so a broken
+    # storage stack now costs detail, not the report.
+    $disks = $null
+    try { $disks = @(Get-PhysicalDisk -ErrorAction Stop) }
+    catch {
+        $why = ($_.Exception.Message -split "`r?`n")[0]
+        Write-Warning "Storage provider unavailable (Get-PhysicalDisk: $why) -- falling back to Win32_DiskDrive."
+        $legacy = @(Get-CimInstance Win32_DiskDrive -ErrorAction SilentlyContinue | ForEach-Object {
+            [pscustomobject]@{
+                Drive      = $_.Model
+                'Size(GB)' = if ($_.Size) { [math]::Round($_.Size / 1GB, 1) } else { 'n/a' }
+                Interface  = $_.InterfaceType
+                # Win32_DiskDrive.Status is the drive's own SMART predictive-failure
+                # verdict: 'OK', or 'Pred Fail' when it expects to die.
+                Status     = if ($_.Status) { $_.Status } else { 'n/a' }
+            }
+        })
+        if ($legacy) {
+            $legacy | Format-Table -AutoSize
+            Add-Result 'Disk health report' 'Partial' 'Storage provider broken; used Win32_DiskDrive (no wear/temp)'
+            Write-Host "  Wear/temperature/read-error counters need the Storage provider. To check it:" -ForegroundColor DarkGray
+            Write-Host "      winmgmt /verifyrepository        (is the WMI store intact?)" -ForegroundColor DarkGray
+            Write-Host "      Get-CimInstance -Namespace root/Microsoft/Windows/Storage -ClassName MSFT_Disk" -ForegroundColor DarkGray
+        } else {
+            Add-Result 'Disk health report' 'Failed' "no disk info available: $why"
+        }
+        return
+    }
+
+    $disks | Select-Object FriendlyName, MediaType, HealthStatus, OperationalStatus | Format-Table -AutoSize
     # Reliability-counter props (Wear/Temperature) are often $null on consumer drives.
     # Render n/a rather than crashing.
     try {
-        Get-PhysicalDisk | ForEach-Object {
+        $disks | ForEach-Object {
             $c = $_ | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue
             [pscustomobject]@{
                 Drive          = $_.FriendlyName
@@ -920,8 +1068,20 @@ function Get-ConnectivityReport {
 # everything else is 'none' (we recommend; we don't risk an unsafe auto-change).
 function Get-IssueKnowledgeBase {
     @(
-        @{ Name = 'App crashes'; Providers = @('Application Error', '.NET Runtime', 'Application Hang'); Severity = 'Medium'; AutoRepair = 'winget-app';
+        @{ Name = 'App crashes'; Providers = @('Application Error', 'Application Hang'); Severity = 'Medium'; AutoRepair = 'winget-app';
            Advice = "Update or reinstall the crashing app; if it hooks into a browser or another app, disable that integration. -RepairIssues can attempt a winget repair/upgrade of packages it can map." }
+        # '.NET Runtime' is TWO unrelated things wearing one source name, so it needs two
+        # rules and the ORDER matters (Resolve-IssueRule returns the first match):
+        #   1. The CLR itself reporting a fatal/unhandled exception -- 1023/1026/1027. A
+        #      real crash.
+        #   2. Any ASP.NET Core app using the EventLog logging provider without setting a
+        #      SourceName. It inherits '.NET Runtime' and writes its OWN ILogger EventId,
+        #      so a routine "HTTP 404 from an upstream API" lands here looking identical
+        #      to a crash. Those are the app's error LOGS -- not crashes, not winget-repairable.
+        @{ Name = 'App crashes'; Providers = @('.NET Runtime'); Ids = @(1023, 1026, 1027); Severity = 'Medium'; AutoRepair = 'winget-app';
+           Advice = "An unhandled .NET exception killed the process. Update or reinstall the app; if it persists, check the app's own logs for the failing call." }
+        @{ Name = 'App error logs (.NET)'; Providers = @('.NET Runtime'); Severity = 'Low'; AutoRepair = 'none';
+           Advice = "These are an application's OWN logged errors (it uses the shared '.NET Runtime' event source), not process crashes -- volume here usually means a misconfigured app: a wrong upstream URL/API key, or a retired third-party endpoint. Fix it in that app's settings; Windows repair tools will not help." }
         @{ Name = 'Service crashes'; Providers = @('Service Control Manager'); Ids = @(7000, 7001, 7009, 7011, 7022, 7023, 7024, 7031, 7034); Severity = 'Medium'; AutoRepair = 'none';
            Advice = "Windows auto-restarts these. If the service belongs to a third-party app, update/reinstall that app. Persistent crashes of a Windows service warrant SFC/DISM (this routine runs them)." }
         @{ Name = 'Disk / filesystem'; Providers = @('disk', 'Microsoft-Windows-Ntfs', 'Ntfs', 'volmgr', 'volsnap'); Severity = 'High'; AutoRepair = 'none';
@@ -1032,7 +1192,15 @@ function Find-EventIssues {
         if ($entry.AutoRepair -eq 'winget-app') {
             # Per-exe crash counts from Application Error (1000) for targeted repair.
             # Layout: [0]=app [6]=exception code [10]=full app path.
-            $appErr = $entry.Events | Where-Object { $_.Id -eq 1000 -and $_.Properties.Count -gt 0 }
+            #
+            # PROVIDER-SCOPED deliberately: event id 1000 is not unique, and only THIS
+            # provider has that property layout. A .NET app logging via the EventLog
+            # provider also writes 1000 under '.NET Runtime', where property [0] is the
+            # whole log message -- which then flowed into Resolve-WingetId and threw on
+            # 5.1. Same Event-ID-collision trap as podman, one layer deeper.
+            $appErr = $entry.Events | Where-Object {
+                $_.ProviderName -eq 'Application Error' -and $_.Id -eq 1000 -and $_.Properties.Count -gt 0
+            }
             $list = foreach ($ag in ($appErr | Group-Object { $_.Properties[0].Value })) {
                 $s = $ag.Group | Select-Object -First 1
                 [pscustomobject]@{
@@ -1043,16 +1211,18 @@ function Find-EventIssues {
             }
             $entry.Apps = @($list | Sort-Object Count -Descending)
             if ($entry.Apps) {
-                $entry.Detail = (($entry.Apps | Select-Object -First 5 | ForEach-Object { "{0} x{1}" -f $_.App, $_.Count }) -join ', ')
+                $entry.Detail = (($entry.Apps | Select-Object -First 5 | ForEach-Object { "{0} x{1}" -f (Format-EventToken $_.App), $_.Count }) -join ', ')
                 $exc = Convert-ExceptionCode $entry.Apps[0].Exc
                 if ($exc -ne 'n/a') { $entry.Detail += "  [$exc]" }
             }
         }
         elseif ($entry.Category -eq 'Service crashes') {
-            # SCM event property [0] is the service name.
+            # SCM property [0] is the service name on every id EXCEPT the two timeout
+            # events -- see Get-EventServiceName. Reading [0] blindly reported the top
+            # culprit as "30000" (a timeout value) alongside the same service counted twice.
             $svcs = $entry.Events | Where-Object { $_.Properties.Count -gt 0 } |
-                Group-Object { $_.Properties[0].Value } | Sort-Object Count -Descending
-            $entry.Detail = (($svcs | Select-Object -First 6 | ForEach-Object { "{0} x{1}" -f $_.Name, $_.Count }) -join ', ')
+                Group-Object { Get-EventServiceName $_ } | Sort-Object Count -Descending
+            $entry.Detail = (($svcs | Select-Object -First 6 | ForEach-Object { "{0} x{1}" -f (Format-EventToken $_.Name 40), $_.Count }) -join ', ')
         }
         else {
             $entry.Detail = "event IDs: $(@($entry.Events | ForEach-Object { $_.Id } | Sort-Object -Unique) -join ', ')"

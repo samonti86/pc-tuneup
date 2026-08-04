@@ -40,6 +40,31 @@ Origin research (the verified command spec this script implements) lives in
   The settings file excludes 3 rules that are deliberate design choices here
   (Write-Host UX, custom -DryRun vs ShouldProcess, plural internal-helper nouns) —
   each with rationale in the .psd1. Any OTHER warning is a real finding; fix it.
+- **Comment-based help must still resolve** (it breaks SILENTLY — see below):
+  ```powershell
+  $h = Get-Help .\Invoke-PCTuneup.ps1
+  if ($h -is [string] -or -not $h.parameters.parameter) { 'HELP BROKEN' }
+  else { "help OK: $(@($h.parameters.parameter).Count) params, $(@($h.examples.example).Count) examples" }
+  ```
+  Two ways to break it, both silent (Get-Help just falls back to auto-generated syntax
+  and every .PARAMETER/.EXAMPLE vanishes): (1) putting `#Requires` immediately adjacent
+  to the opening `<#` with no blank line between; (2) any literal `#>` appearing in a
+  `#` line comment before the help block — it terminates the block early. Both were hit
+  for real on 2026-08-04.
+- **Runtime smoke tests MUST run under Windows PowerShell 5.1, not pwsh.** Parse +
+  PSSA are static and pass identically on both; they do NOT catch .NET Framework vs
+  .NET Core *behavior* differences. Real example (2026-08-04): `[IO.Path]::
+  GetFileNameWithoutExtension()` throws "Illegal characters in path" on 5.1 and
+  silently accepts the same input on 7.x — the bug was invisible in pwsh and failed a
+  step in production. Pattern used throughout this project: AST-load the shipped
+  function bodies and exercise them, explicitly under 5.1:
+  ```powershell
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\smoke.ps1
+  ```
+  Shadowing a cmdlet with a same-named function is the cheap way to simulate hardware
+  you don't have (e.g. a multi-drive box, or a broken Storage WMI provider) — PowerShell
+  resolves functions ahead of cmdlets, so a dot-sourced function under test picks up the
+  stub. Watch for stub params colliding with common parameters like `-ErrorAction`.
 
 ## Constraints & Rules
 - **Cross-version first.** Anything added must work on Win10 1809+ AND Win11. If a
@@ -256,6 +281,82 @@ Origin research (the verified command spec this script implements) lives in
       rebuild, never at a boot crash. Two independent problems, not one.
       Also disproven this session: ESENT 902 x66 is Unistore (Mail/Calendar/People sync DB)
       reporting a Microsoft-internal threading defect -- unrelated to Search, not user-fixable.
-- [ ] Test on a Windows 10 machine to confirm cross-version behavior
+- [x] FIRST WINDOWS 10 RUN (2026-08-04, Win10 22H2 / 19045, PS 5.1 Desktop):
+      `-DeepClean -NetworkReset -RepairIssues -FlushUpdateCache`. Cross-version core all
+      ported clean -- cmd-piped chkdsk /f /r scheduling + chkntfs verification, netsh
+      Partial classifier, DISM 3010, elapsed formatting, update-count reporting; Defender
+      actually ran a QuickScan here (Win11 box has Malwarebytes primary, so this was the
+      first real exercise of that path). 2 steps FAILED + 1 silently vanished -> 5 bugs
+      found and fixed:
+      (1)+(2) SAME ROOT CAUSE. Ombi (ASP.NET Core) uses the EventLog logging provider
+      without setting a SourceName, so it inherits the SHARED '.NET Runtime' event source
+      and writes its OWN ILogger EventId -- which is 1000. The app-crash extractor filtered
+      on `$_.Id -eq 1000` ALONE, so it read those as Application Error records, and
+      Properties[0] (the exe name for a real crash) was instead Ombi's entire multi-line
+      log message. That both dumped ~40 lines of stack trace into the report AND crashed
+      step 1b when the blob reached [IO.Path]::GetFileNameWithoutExtension().
+      >>> THE LESSON: that API THROWS "Illegal characters in path" on .NET Framework (5.1)
+      and SILENTLY ACCEPTS the same input on .NET Core (7.x). Verifying under both 5.1 and
+      7.6 does NOT protect you here -- the bug is INVISIBLE under 7 and only detonates on
+      5.1, the shipping target. Treat "works in pwsh" as no evidence at all for this class.
+      Fixes: $appErr now provider-scoped to 'Application Error' (Event-ID-1000 collision,
+      same trap as podman one layer deeper); new Test-PlausibleFileName guard so
+      Resolve-WingetId DECLINES rather than throws; new Format-EventToken collapses/clips
+      any event string before it reaches the report; KB rule split so '.NET Runtime'
+      1023/1026/1027 stays 'App crashes' while everything else becomes a new Low-severity
+      'App error logs (.NET)' category whose advice points at app config, not Windows tools.
+      (3) STEP 5 SILENTLY VANISHED FROM THE SUMMARY -- the worst failure mode this tool has.
+      Get-Volume failed (broken Storage WMI provider, see below), $volumes came back empty,
+      the foreach had nothing to iterate, and NO Add-Result ever ran. Not Failed, not
+      Skipped: absent. Optimize-Drives now derives the system drive from $env:SystemDrive
+      (so the DEFAULT path needs no WMI at all), falls back to Win32_LogicalDisk then to
+      `defrag.exe /O`, and ALWAYS records an outcome.
+      (4) Get-PhysicalDisk was outside any try/catch. Note its error surfaced from the
+      ENUMERATOR ("Exception calling MoveNext"), i.e. terminating mid-pipeline -- so
+      -ErrorAction SilentlyContinue would NOT have saved it either. Now falls back to
+      Win32_DiskDrive (classic CIMv2, unaffected) and reports Partial.
+      (5) Service-crash culprits read Properties[0] unconditionally, but SCM puts the
+      service name at [1] on the two TIMEOUT events (7009/7011) where [0] is the timeout in
+      ms -- so the top culprit rendered as "30000" and the same service was counted twice.
+      New Get-EventServiceName picks the index by event id. Verified against real SCM
+      events on the Win11 box.
+      Verified: parse OK 5.1 + pwsh, PSSA clean, AST-loaded smoke tests of every fix under
+      5.1 SPECIFICALLY (incl. shadowing Get-Volume/Get-CimInstance to simulate the Win10
+      C/D/M/T layout and the broken-provider path).
+- [x] Step 5 scoped to the SYSTEM DRIVE by default + new opt-in `-OptimizeAllDrives`
+      (2026-08-04, user decision). The Win10 box has 33 TB and 22 TB fixed volumes attached;
+      once bug (3) was fixed, step 5 would have started actually optimizing them -- a
+      potentially multi-hour defrag inside a routine that otherwise takes ~15 min, which is
+      unacceptable on someone else's PC. Non-system drives still get a `Skipped` summary row
+      (what we did NOT touch is part of an honest report).
+- [ ] Machine findings from the Win10 box (NOT script bugs, tracked so they aren't lost):
+      Computer Browser service crash-looping ~267x/7d (user disabling via
+      `sc.exe config Browser start= disabled`; needs `sc.exe stop Browser` to take effect
+      now, revert with `start= demand`). Ombi still RUNNING despite the user believing it
+      was uninstalled -- proven by recency (51 events in last 24h, last one 54 min before
+      the run started); likely a leftover Windows SERVICE, which is why it's invisible in
+      the startup audit (that reads Win32_StartupCommand, which does not cover services) --
+      same shape as the ExpressVPN orphaned-driver finding. Its errors are a Sonarr v2 API
+      path (`/api/series`, moved to `/api/v3/series` in Sonarr v3+) and a retired Plex
+      endpoint returning 410 Gone. SFC found and repaired real corruption -- re-run
+      `sfc /scannow` after reboot to confirm clean. Storage WMI provider broken (hypothesis,
+      UNVERIFIED: third-party storage/pooling provider, given the 33/22 TB volumes report as
+      local fixed disks); check `winmgmt /verifyrepository`. Box is Win10 22H2, out of
+      mainstream support since 2025-10-14 -- confirm whether it's on consumer ESU.
+- [x] COMMENT-BASED HELP WAS SILENTLY DEAD (2026-08-04, found incidentally while verifying
+      the new -OptimizeAllDrives param during close-out). `Get-Help .\Invoke-PCTuneup.ps1`
+      returned a bare auto-generated SYNTAX STRING, not help: 0 parameters, 0 examples,
+      no description -- every .PARAMETER/.EXAMPLE in the 90-line help block was invisible,
+      and the README explicitly promises `Get-Help -Full` works. Cause: `#Requires -Version
+      5.1` sat IMMEDIATELY adjacent to the opening `<#`. PowerShell then does not associate
+      the block with the script; one blank line between them fixes it. Verified pre-existing
+      (HEAD had it too), and isolated with a 3-case minimal repro (no-#Requires / adjacent /
+      blank-line-after) rather than guessed. Then hit a SECOND instance of the same class
+      immediately: the explanatory comment written to document the fix contained a literal
+      `#>`, which terminated the help block early and re-broke it -- and also corrupted the
+      bisect that was hunting it. Both traps now recorded in the sanity gate above, which
+      gained a Get-Help assertion, because this failure mode is 100% silent.
+      Now: 13 params, 3 examples, real synopsis, on BOTH 5.1 and pwsh.
+- [x] Test on a Windows 10 machine to confirm cross-version behavior (2026-08-04, above)
 - [ ] Optional: add to command-center projects-index
 - [ ] Optional: scheduled-task wrapper for monthly auto-run
