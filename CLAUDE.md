@@ -127,7 +127,7 @@ Things the tool *found* on the Win10 box. Tracked here so they are not lost.
       recency (51 events in 24h; the last 54 minutes before the run started).
       Likely a leftover Windows **service**, which is exactly why the startup audit
       misses it: `Win32_StartupCommand` does not cover services. Same shape as the
-      ExpressVPN orphaned-driver finding. Its errors are a Sonarr v2 API path
+      orphaned VPN-client driver finding. Its errors are a Sonarr v2 API path
       (`/api/series`, moved to `/api/v3/series` in v3+) and a retired Plex endpoint
       returning 410 Gone.
 - [ ] **Re-run `sfc /scannow` after reboot.** SFC found and repaired real

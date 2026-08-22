@@ -513,7 +513,7 @@ function Repair-Issues {
         Write-Warning "winget not available -- cannot auto-repair. See the health report for manual steps."
         return
     }
-    # Several faulting exes can map to one package (e.g. ExpressVPN's helper +
+    # Several faulting exes can map to one package (e.g. a VPN client's helper +
     # notification service). Repair each package at most once per run.
     $seen = New-Object System.Collections.Generic.HashSet[string]
     foreach ($iss in $repairable) {
@@ -1399,7 +1399,7 @@ function Resolve-CommandPath {
 # auto-start SERVICES and 5 non-Microsoft logon/boot SCHEDULED TASKS it never saw. Under a
 # third of reality. That blind spot is not academic: it is precisely why a leftover Ombi
 # service kept running (and logging errors) on a machine whose owner believed it was
-# uninstalled, and why a pair of orphaned ExpressVPN drivers stayed invisible for weeks.
+# uninstalled, and why a pair of orphaned VPN-client drivers stayed invisible for weeks.
 function Get-AutostartEntries {
     $entries = @()
 
