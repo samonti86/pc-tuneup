@@ -1397,9 +1397,9 @@ function Resolve-CommandPath {
 # Win32_StartupCommand -- all this report used to show -- covers only the Run keys and the
 # Startup folders. Measured on a live box: 12 entries there, against 22 non-Windows
 # auto-start SERVICES and 5 non-Microsoft logon/boot SCHEDULED TASKS it never saw. Under a
-# third of reality. That blind spot is not academic: it is precisely why a leftover Ombi
-# service kept running (and logging errors) on a machine whose owner believed it was
-# uninstalled, and why a pair of orphaned VPN-client drivers stayed invisible for weeks.
+# third of reality. That blind spot is not academic: it is precisely why a leftover
+# media-server service kept running (and logging errors) on a machine whose owner believed
+# it was uninstalled, and why a pair of orphaned VPN-client drivers stayed invisible for weeks.
 function Get-AutostartEntries {
     $entries = @()
 

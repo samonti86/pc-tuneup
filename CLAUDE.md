@@ -118,23 +118,21 @@ history. **When work completes, move it there** and keep this file under ~25 KB.
 
 ### Open — machine findings (NOT script bugs)
 
-Things the tool *found* on the Win10 box. Tracked here so they are not lost.
+⚠️ **Moved out of this repo on 2026-08-21. They now live in
+`~/repos/command-center/research/machine-findings-2026-08.md` (private).**
 
-- [ ] **Computer Browser service crash-looping ~267×/7d.** Being disabled via
-      `sc.exe config Browser start= disabled`; needs `sc.exe stop Browser` to take
-      effect now. Revert with `start= demand`.
-- [ ] **Ombi is still RUNNING** despite being believed uninstalled — proven by
-      recency (51 events in 24h; the last 54 minutes before the run started).
-      Likely a leftover Windows **service**, which is exactly why the startup audit
-      misses it: `Win32_StartupCommand` does not cover services. Same shape as the
-      orphaned VPN-client driver finding. Its errors are a Sonarr v2 API path
-      (`/api/series`, moved to `/api/v3/series` in v3+) and a retired Plex endpoint
-      returning 410 Gone.
-- [ ] **Re-run `sfc /scannow` after reboot.** SFC found and repaired real
-      corruption; confirm it comes back clean.
-- [ ] **Storage WMI provider possibly broken** *(hypothesis, UNVERIFIED)* — a
-      third-party storage/pooling provider is suspected, since the 33/22 TB volumes
-      report as local fixed disks. Check `winmgmt /verifyrepository`.
+**This repo is PUBLIC.** Those notes were personal machine state — installed
+software by name, storage layout, filesystem corruption found by SFC — and none
+of it was documentation *of the tool*. It was working notes about one person's
+machines, published to the world by accident of where it was written down.
+
+They are **not** genericized, because a generic version is a useless version:
+*"a media service is still running"* does not tell you what to uninstall. Full
+detail is preserved in the private file; only the location changed.
+
+**Findings belong there. Script defects belong here.** If a future run surfaces
+something about the machine rather than about the tool, write it to
+`command-center`, not to this file.
 
 ### Open — optional
 
