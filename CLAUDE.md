@@ -358,5 +358,105 @@ Origin research (the verified command spec this script implements) lives in
       gained a Get-Help assertion, because this failure mode is 100% silent.
       Now: 13 params, 3 examples, real synopsis, on BOTH 5.1 and pwsh.
 - [x] Test on a Windows 10 machine to confirm cross-version behavior (2026-08-04, above)
+- [x] END-TO-END READ + 4 FIXES (2026-08-19). Full 1466-line pass looking for correctness
+      and reporting defects. Found 6 real issues + minors; user chose to fix 1-4 first,
+      TEST, then add features A/B/C (below).
+      (1) FALSE "CLEAN" ON A FAILED SCAN -- the worst reporting bug found so far. If
+      Find-EventIssues threw, Invoke-Step recorded 'Event analysis Failed', but $script:Issues
+      stayed EMPTY and Get-HealthReport's empty branch then printed "No notable issues
+      classified. Clean." + 'Health analysis OK'. The summary carried two contradictory rows
+      and the REASSURING one was wrong. An empty issue list has two causes -- healthy machine
+      vs dead scan -- and they rendered identically. Fix: $script:EventScanOk, set true ONLY
+      on a completed sweep (incl. the legitimate zero-events early return); the report now
+      says "EVENT SCAN DID NOT COMPLETE -- do NOT read this as clean" and records Failed.
+      (2) REPORT FINDINGS ALL RENDERED AS 'OK'. The summary Status column only answered
+      "did the step execute", never "did it find something". A HIGH-severity impending-disk-
+      failure issue, a 6%-free drive, a DIRTY volume, dead connectivity and a pending reboot
+      were ALL 'OK'; you had to read the Detail column to notice. Added a 'Warn' status
+      (step worked; MACHINE has a problem -- orthogonal to 'Failed' = tool didn't work) plus
+      a second end-of-run tally that reprints every Warn as a checklist. Severity mapping:
+      High always warns; Medium warns only while ACTIVE (Recent24h > 0, since a stale Medium
+      is already tagged "may already be resolved"); Low never warns.
+      (3) winget REPAIR FALLBACK REPORTED FALSE FAILURES. Measured live: `winget repair`
+      -> 0x8A15007C (-1978335108) "installer technology does not support repair", then the
+      `winget upgrade` fallback -> 0x8A15002B (-1978335189) "No available upgrade found".
+      Both non-zero, so a package that simply CANNOT be repaired and is ALREADY CURRENT was
+      reported Failed. That is the COMMON case (a crashing app is usually already newest),
+      not an edge case. New Get-WingetNoOpReason maps both to Skipped naming both reasons;
+      also applied to Update-Apps so "nothing to upgrade" is OK, not Partial. Same
+      false-failure family as DISM 3010 / chkdsk exit 3 / the netsh ACL key.
+      (4) HARDCODED C: while Optimize-Drives already derived $env:SystemDrive -- chkdsk
+      /scan, the /f /r scheduling, chkntfs verification, both manual-fix hints, the restore-
+      point hint and both free-space snapshots. Wrong volume on any box where Windows isn't
+      on C:. Now one $script:SysDriveLetter / $script:SysDrive pair defined at setup and used
+      everywhere; grep for hardcoded C: outside comments returns nothing.
+      Verified: parse OK 5.1, PSSA clean, Get-Help 13 params/3 examples, AST-loaded smoke
+      tests of all 4 fixes under 5.1, plus a regression run of every prior-session fix.
+- [ ] NOT YET FIXED from the same read (deliberately deferred, user sequenced the work):
+      (5) Invoke-Defender writes TWO different step names ('Defender' on skip/fail paths vs
+      'Defender scan' on success) -- inconsistent summary. (6) SFC/DISM outcomes aren't
+      classified: "found corrupt files and successfully repaired them" (which really happened
+      on the Win10 box and drove a post-reboot re-run) is indistinguishable from "no
+      violations found" -- both render 'OK exit 0'. Same shape as the Windows Update
+      count fix. (7) Minors: w32tm pipes its output to Out-Null so a failure gives an exit
+      code and no reason (same class as the chkdsk fix); Repair-Issues interpolates $app.App
+      into a step name without Format-EventToken; temp cleanup only inspects TOP-LEVEL
+      entries, and a directory's mtime updates when its children change, so an active folder
+      shields arbitrarily old contents from the 24h rule (reclaims less than it appears to).
+- [x] FIXES 1-4 VALIDATED IN PRODUCTION (2026-08-19, tuneup-2026-08-19-111404, pwsh 7,
+      -DeepClean -NetworkReset -FlushUpdateCache -ResetStore, 1h05m). 'Warn' fired
+      SELECTIVELY exactly as designed: 'Issue: Service crashes' (Medium, 4 in last 24h =
+      active) and 'Pending reboot' warned, while five Low categories AND the stale Hyper-V
+      category correctly stayed OK; the new tally reprinted both as a checklist. System-drive
+      derivation live ('Optimize C:', 'reclaimed 1.73 GB (C: 66.06->67.79 GB)'). Only WARNING
+      in the whole log was the intentional -NetworkReset notice; no TerminatingError. Prior
+      fixes still holding (service culprits render 'WSearch x24, WMPNetworkSvc x3, HNS x1...'
+      with no '30000'; 'App error logs (.NET)' classified 25 events). CAVEAT: fix 3's winget
+      no-op path was NOT exercised (Issue repair hit 'nothing safely auto-repairable') --
+      it is unit-verified only, still awaiting a production run that actually repairs.
+- [x] FEATURES A + B + C SHIPPED (2026-08-19) as one coherent
+      "what is actually running on this machine, and what's broken" pass.
+      A. STARTUP AUDIT -> FULL AUTOSTART SURFACE. Measured on the Win11 box: Win32_StartupCommand
+         sees 12 entries; it MISSES 22 non-Windows auto-start services and 5 non-Microsoft
+         logon/boot scheduled tasks. Under a third of reality -- and exactly the blind spot
+         that hid Ombi (a service) on the Win10 box and the ExpressVPN drivers before it.
+      B. DEVICE HEALTH via Win32_PnPEntity ConfigManagerErrorCode != 0. NOTE: an
+         orphaned-driver detector was DECLINED earlier as "narrow value, false-positive-prone";
+         this is different and the user agreed to it -- it reads WINDOWS' OWN verdict (the
+         same field Device Manager renders as a yellow bang), not a heuristic. It already
+         proved itself: it found ROOT\NET\0000 "ExpressVPN TUN Driver" and ROOT\NET\0001
+         "ExpressVPN TAP Adapter", both ConfigManagerErrorCode 19 / Status Error, on this box
+         RIGHT NOW -- residue of the June cleanup (services gone, expressvpntun.sys gone, but
+         tapexpressvpn.sys still on disk and both device nodes still registered). Report-only;
+         removal (pnputil /remove-device) would be a separate opt-in to argue on its own.
+      C. STARTUP/AUTOSTART ENTRIES POINTING AT MISSING FILES -- classic partial-uninstall
+         residue, composes with A.
+      AS BUILT: Get-StartupAudit rewritten (step now named 'Autostart audit') over a new
+      Get-AutostartEntries collector; new Get-DeviceHealthReport + Convert-DeviceErrorCode
+      (CM_PROB_* decoded to plain English); new Resolve-CommandPath for C. Live on the Win11
+      box: 39 entries (12 Run/Startup + 22 services + 5 tasks) vs 12 before, 0 broken; device
+      health -> Warn naming both ExpressVPN ghosts. ScheduledTasks is imported EXPLICITLY --
+      it is CDXML, same module-AUTOLOAD trap that once broke the DNS report -- and a failure
+      degrades to "Run keys + services only", never a dead step.
+      TWO DESIGN RULES worth keeping: (1) Resolve-CommandPath returns $null rather than
+      guessing, because a wrong guess becomes a FALSE "this entry is broken" accusation --
+      bare '.lnk' names and rundll32-style commands are reported as unverifiable, not broken.
+      (2) ConfigManagerErrorCode 22 = user DISABLED the device deliberately; it is counted,
+      never warned on, or every intentionally-disabled device becomes a false alarm.
+      BUG CAUGHT IN TESTING: a scheduled task's .Execute is sometimes ALREADY quoted, so
+      concatenating it raw produced '""C:\path\x.exe" args' -- the first quote pair enclosed
+      nothing, Resolve-CommandPath found an empty path and SILENTLY SKIPPED the existence
+      check (RtkAudUService64_BG). Fixed by stripping quotes before rebuilding the command.
+      Verified: parse OK 5.1, PSSA clean, Get-Help 13 params, live run of both reports under
+      5.1, plus a NEGATIVE test (shadowed collector with fabricated dead entries across all
+      three surfaces) proving detection + the Warn row, with a good entry and an unverifiable
+      .lnk correctly excluded.
+      Investigated and REJECTED with evidence: boot-performance analysis
+      (Diagnostics-Performance/Operational id 100/101/102/103) would name the exact slow
+      app/driver/service at boot and would have caught the WSearch startup race -- but that
+      log returned 0 events on this box (disabled on many systems), so it is conditional
+      value only. SMART via MSStorageDriver_FailurePredictStatus returned nothing -- it is an
+      ATA/SATA-era WMI class that NVMe drives don't populate, so it would be dead code on
+      most modern hardware.
 - [ ] Optional: add to command-center projects-index
 - [ ] Optional: scheduled-task wrapper for monthly auto-run

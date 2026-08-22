@@ -129,7 +129,8 @@ These are **read-only** and run on every invocation, including `-DryRun` and
 | **DNS servers + cache flush** | Configured DNS servers per interface. Also flushes the DNS client cache (suppressed under `-DryRun`/`-ReportOnly`). |
 | **Network connectivity** | Reachability of your default gateway, the internet (1.1.1.1), and DNS resolution. |
 | **Event Viewer health analysis** | The main event. See the next section. |
-| **Startup programs** | What launches at boot, and from where. |
+| **Autostart audit** | Everything that starts on its own, across all **three** surfaces Windows uses: Run keys + Startup folders, non-Windows auto-start **services**, and non-Microsoft **scheduled tasks** that fire at logon or boot. Also flags any entry pointing at a file that no longer exists. |
+| **Device health** | Devices Windows itself reports as faulty — the same `ConfigManagerErrorCode` that Device Manager renders as a yellow warning icon — with the problem decoded in plain English. Devices you deliberately disabled are counted, never flagged. |
 | **Power / battery** | Generates `powercfg /energy` and (on laptops) `/batteryreport` HTML files. |
 | **Pending reboot** | Whether a restart is owed, and which subsystem is asking. Important because `chkdsk /f /r`, DISM and `-NetworkReset` all **defer work to next boot** — this is what tells you the run isn't truly finished. |
 
@@ -258,18 +259,40 @@ Every run ends with a summary table of every step and its status:
 
 | Status | Meaning |
 |--------|---------|
-| **OK** | Completed successfully. |
+| **OK** | Completed successfully, and found nothing wrong. |
+| **Warn** | The step worked fine, but it **found a problem with the machine** — low disk space, a volume flagged dirty, failing connectivity, a pending reboot, or a High-severity event-log issue. |
 | **Partial** | Ran, but not everything succeeded — e.g. `winget` couldn't upgrade some packages, or `netsh int ip reset` hit the one ACL-locked registry key Windows protects. Worth a look, not an emergency. |
 | **Skipped** | Deliberately not run: an opt-in switch you didn't pass, or a feature that isn't present (no `winget`, no battery, Defender stood down for another AV). The reason is always in the Detail column. |
 | **DryRun** | Would have run; suppressed by `-DryRun`. |
 | **Failed** | Genuinely failed. Check the Detail column and the transcript. |
 
+**`Failed` and `Warn` answer different questions.** `Failed` means *the tool* couldn't do
+its job. `Warn` means the tool worked perfectly and *your PC* needs attention. A run can
+be completely `Failed`-free and still be telling you a drive is about to die — so the run
+ends with both tallies, and every `Warn` is reprinted as a checklist:
+
+```text
+1 step(s) FAILED -- review above and the transcript.
+3 finding(s) NEED ATTENTION (status 'Warn'):
+    - Issue: Disk / filesystem: High; 14 events; 6 in last 24h; last 8/19
+    - Disk space: LOW: C: 6%
+    - Pending reboot: YES: Component-Based Servicing (DISM/SFC/updates)
+```
+
 A step that hits an unexpected error is recorded as `Failed` and the run **continues** —
 one bad step can never cost you the remaining steps or the summary.
 
-> **Note:** `exit 3010` from DISM is *success with a reboot required*, and is reported
-> as `OK`, not a failure. Likewise the single "Access is denied" key during
-> `netsh int ip reset` is a known, harmless Windows ACL quirk and reports as `Partial`.
+> **Notes on codes that look like failures but aren't:** `exit 3010` from DISM is
+> *success with a reboot required* and reports as `OK`. The single "Access is denied"
+> key during `netsh int ip reset` is a known, harmless Windows ACL quirk and reports as
+> `Partial`. And under `-RepairIssues`, a package that winget can't repair *and* that is
+> already on the latest version reports as `Skipped` with both reasons named — nothing
+> is broken, there is simply nothing for winget to apply.
+
+**Which event-log issues raise a `Warn`:** High severity always does. Medium does only
+while it's still active (events in the last 24 h) — a Medium issue with nothing recent is
+already tagged *may already be resolved*, so it stays `OK`. Low severity is benign noise
+by definition and never warns.
 
 ## Logs and files it writes
 

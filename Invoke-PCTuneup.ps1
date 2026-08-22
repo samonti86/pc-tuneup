@@ -160,6 +160,21 @@ if (-not (Test-IsAdmin)) {
 $script:DryRun  = [bool]$DryRun
 $script:Results = New-Object System.Collections.Generic.List[object]
 
+# Windows is NOT always installed on C: (imaged corporate builds, dual-boot layouts,
+# and recovery-partition oddities all move it). Derive the system drive ONCE here and
+# use it everywhere instead of hardcoding 'C'. $env:SystemDrive is authoritative and,
+# unlike Get-Volume, needs no WMI -- so it still works on a box whose Storage provider
+# is broken. Two forms because callers want both: 'C' for -DriveLetter params, 'C:' for
+# native tools like chkdsk/chkntfs.
+$script:SysDriveLetter = "$env:SystemDrive".TrimEnd(':')
+$script:SysDrive       = "$($script:SysDriveLetter):"
+
+# Did the Event Viewer sweep actually COMPLETE? Load-bearing: if Find-EventIssues throws,
+# $script:Issues stays empty, and an empty issue list is indistinguishable from a genuinely
+# healthy machine -- so the health report cheerfully printed "Clean". A failed scan must
+# never render as a clean bill of health. Set $true only on a completed sweep.
+$script:EventScanOk = $false
+
 $script:RunStamp = Get-Date -Format 'yyyy-MM-dd-HHmmss'
 $script:LogDir   = Join-Path $env:USERPROFILE 'pc-tuneup-logs'
 if (-not (Test-Path $script:LogDir)) { New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null }
@@ -207,9 +222,10 @@ function Test-CommandExists {
 }
 
 # Free space (GB) on a drive, or $null if it can't be read. Used to report how
-# much cleanup actually reclaimed.
+# much cleanup actually reclaimed. Defaults to the SYSTEM drive, not a hardcoded 'C' --
+# a stale 'C' default is exactly the trap this change exists to remove.
 function Get-FreeSpaceGB {
-    param([string]$Drive = 'C')
+    param([string]$Drive = $script:SysDriveLetter)
     try {
         $d = Get-PSDrive -Name $Drive -ErrorAction Stop
         return [math]::Round($d.Free / 1GB, 2)
@@ -345,6 +361,26 @@ function Resolve-WingetId {
     return (Get-WingetIdFromListing -Raw $out)
 }
 
+# Translate a winget exit code that means "nothing to do here" into a human reason,
+# or $null if the code is a genuine failure.
+#
+# Same false-failure family as DISM 3010, chkdsk exit 3, and the netsh ACL-locked key:
+# a non-zero code that does NOT mean something broke. It matters most on the repair
+# path, because a crashing app is very often ALREADY on the newest version -- so this
+# is the COMMON outcome, not an edge case, and it was being reported as Failed.
+#
+# Codes measured directly (winget 1.x); the hex is the documented APPINSTALLER_CLI_ERROR:
+#   0x8A15002B (-1978335189)  UPDATE_NOT_APPLICABLE  "No available upgrade found."
+#   0x8A15007C (-1978335108)  "The installer technology in use does not support repair."
+function Get-WingetNoOpReason {
+    param([int]$Code)
+    switch ($Code) {
+        -1978335189 { return 'already at the latest version' }
+        -1978335108 { return 'this package type does not support winget repair' }
+        default     { return $null }
+    }
+}
+
 # Run a native EXE and judge success by $LASTEXITCODE (these tools don't throw).
 function Invoke-Native {
     param(
@@ -422,7 +458,7 @@ function New-RestoreCheckpoint {
     } catch {
         Add-Result 'Restore point' 'Skipped' $_.Exception.Message
         Write-Warning "Could not create restore point: $($_.Exception.Message)"
-        Write-Host "  (Enable once with: Enable-ComputerRestore -Drive 'C:\')" -ForegroundColor DarkGray
+        Write-Host "  (Enable once with: Enable-ComputerRestore -Drive '$($script:SysDrive)\')" -ForegroundColor DarkGray
     }
 }
 
@@ -444,8 +480,13 @@ function Update-Apps {
     # to upgrade. Surface that as Partial rather than a false OK. (Exit 0 includes the
     # benign "nothing to upgrade" case, so that still reports OK.)
     $code = $LASTEXITCODE
+    $noOp = Get-WingetNoOpReason $code
     if ($code -eq 0) {
         Add-Result 'App updates (winget)' 'OK'
+    } elseif ($noOp) {
+        # e.g. "No available upgrade found" -- nothing was pending. That is a clean run,
+        # not a partial one.
+        Add-Result 'App updates (winget)' 'OK' "nothing to upgrade ($noOp)"
     } else {
         Add-Result 'App updates (winget)' 'Partial' ("winget exit {0} (0x{0:X8})" -f $code)
         Write-Warning "winget upgrade --all returned exit $code -- one or more apps may not have updated."
@@ -495,7 +536,8 @@ function Repair-Issues {
             # which is the next-safest fix for an app-level bug.
             Write-Host "  Repairing $($app.App) -> winget package '$id'..." -ForegroundColor Cyan
             winget repair --id $id --silent --accept-source-agreements --disable-interactivity
-            $code = $LASTEXITCODE
+            $code        = $LASTEXITCODE
+            $repairNoOp  = Get-WingetNoOpReason $code
             if ($code -ne 0) {
                 Write-Host "  repair unavailable/failed (exit $code); trying 'winget upgrade'..." -ForegroundColor DarkGray
                 winget upgrade --id $id --include-unknown `
@@ -503,8 +545,18 @@ function Repair-Issues {
                     --silent --disable-interactivity
                 $code = $LASTEXITCODE
             }
+            $noOp = Get-WingetNoOpReason $code
             if ($code -eq 0) {
                 Add-Result "Repair $($app.App)" 'OK' $id
+            } elseif ($noOp) {
+                # Nothing broke -- winget simply had nothing to apply. The usual shape is
+                # "this package type can't be repaired" AND "it's already current", which
+                # together mean the crash is not something winget can fix. Report that
+                # plainly instead of a false Failed, and name BOTH reasons when we have them.
+                $why = if ($repairNoOp -and $repairNoOp -ne $noOp) { "$repairNoOp; $noOp" } else { $noOp }
+                Add-Result "Repair $($app.App)" 'Skipped' "$id -- $why"
+                Write-Host "  '$id': $why -- winget has nothing to apply." -ForegroundColor Yellow
+                Write-Host "    If it keeps crashing, reinstall it manually or check the app's own settings." -ForegroundColor DarkGray
             } else {
                 Add-Result "Repair $($app.App)" 'Failed' "$id (exit $code)"
                 Write-Warning "Repair of '$id' returned exit $code -- repair it manually."
@@ -563,10 +615,10 @@ function Invoke-ChkdskScan {
     Write-Section "4. Filesystem check (chkdsk)"
     # /scan is online and non-destructive (no reboot). /f /r locks the volume and
     # runs at next boot -- only under -DeepClean.
-    Invoke-Native 'chkdsk online scan' 'chkdsk.exe' @('C:','/scan')
+    Invoke-Native 'chkdsk online scan' 'chkdsk.exe' @($script:SysDrive,'/scan')
     if ($DeepClean) {
         Write-Host "  -DeepClean: scheduling full chkdsk /f /r at next reboot..." -ForegroundColor Yellow
-        if (Confirm-Action "chkdsk C: /f /r (reboot-time)") {
+        if (Confirm-Action "chkdsk $($script:SysDrive) /f /r (reboot-time)") {
             # Let CMD do the piping -- NOT PowerShell. chkdsk's "schedule at next restart?
             # (Y/N)" prompt is not satisfied by a PowerShell pipeline: `'Y' | chkdsk.exe`
             # leaves it unanswered, so chkdsk re-prompts three times and schedules NOTHING.
@@ -574,7 +626,7 @@ function Invoke-ChkdskScan {
             # PS pipe -> "C: is not dirty" (nothing scheduled); cmd echo -> "Chkdsk has been
             # scheduled manually to run on next reboot". Do not "simplify" this back to a
             # native PowerShell pipe.
-            cmd.exe /c "echo y|chkdsk C: /f /r"
+            cmd.exe /c "echo y|chkdsk $($script:SysDrive) /f /r"
             $code = $LASTEXITCODE
 
             # IGNORE THE EXIT CODE -- it is genuinely meaningless here. chkdsk returns 3
@@ -584,7 +636,7 @@ function Invoke-ChkdskScan {
             # chkntfs reports whether autochk will really run on this volume at next boot,
             # which is the only fact that matters. An exit code is a claim; this is reality.
             $verify = ''
-            try { $verify = (& chkntfs.exe C: 2>&1 | Out-String) }
+            try { $verify = (& chkntfs.exe $script:SysDrive 2>&1 | Out-String) }
             catch { Write-Verbose "chkntfs query failed: $($_.Exception.Message)" }
             $scheduled = ($verify -match 'scheduled') -or
                          ($verify -match 'is dirty' -and $verify -notmatch 'not dirty')
@@ -602,8 +654,8 @@ function Invoke-ChkdskScan {
                 Add-Result 'chkdsk /f /r (scheduled)' 'Failed' 'chkntfs shows NO scheduled check'
                 Write-Warning "chkntfs reports no scheduled check -- the boot-time chkdsk was NOT scheduled."
                 Write-Host "  To schedule it by hand, run this in an elevated prompt and answer Y:" -ForegroundColor Yellow
-                Write-Host "      chkdsk C: /f /r" -ForegroundColor Yellow
-                Write-Host "  (To cancel a scheduled check later:  chkntfs /x C:)" -ForegroundColor DarkGray
+                Write-Host "      chkdsk $($script:SysDrive) /f /r" -ForegroundColor Yellow
+                Write-Host "  (To cancel a scheduled check later:  chkntfs /x $($script:SysDrive))" -ForegroundColor DarkGray
             }
         } else { Add-Result 'chkdsk /f /r (scheduled)' 'DryRun' }
     }
@@ -626,7 +678,7 @@ function Optimize-Drives {
     # and returned nothing. The old loop then had nothing to iterate, added NO result, and
     # the step VANISHED from the summary. A silent no-op is the one outcome this tool must
     # never produce.
-    $sysDrive = "$env:SystemDrive".TrimEnd(':')
+    $sysDrive = $script:SysDriveLetter
     $targets  = @($sysDrive)
 
     # Enumerate the other fixed drives so they can be REPORTED as skipped (and optimized
@@ -691,7 +743,7 @@ function Clear-TempFiles {
     if ($SkipCleanup) { Add-Result 'Cleanup' 'Skipped' '-SkipCleanup'; return }
 
     # Snapshot free space so we can report what cleanup actually reclaimed.
-    $beforeGB = Get-FreeSpaceGB 'C'
+    $beforeGB = Get-FreeSpaceGB $script:SysDriveLetter
 
     # Delete only temp items NOT touched in the last 24h, and never the CDXML/CIM
     # module proxies PowerShell drops here (remoteIpMoProxy_*). Why: this script runs
@@ -722,14 +774,14 @@ function Clear-TempFiles {
     Invoke-Native 'WinSxS component cleanup' 'DISM.exe' $dismArgs -SuccessCodes @(0, 3010)
 
     # Report reclaimed space (real runs only -- under -DryRun nothing was deleted).
-    $afterGB = Get-FreeSpaceGB 'C'
+    $afterGB = Get-FreeSpaceGB $script:SysDriveLetter
     if (-not $DryRun -and $null -ne $beforeGB -and $null -ne $afterGB) {
         $reclaimed = [math]::Round($afterGB - $beforeGB, 2)
         # Free space can DROP mid-run (a background process or the Defender scan writing),
         # making this negative. Label it "net change" then so the number isn't misread.
         $word = if ($reclaimed -lt 0) { 'net change' } else { 'reclaimed' }
-        Write-Host ("  C: free space  {0} GB -> {1} GB  ({2} {3} GB)" -f $beforeGB, $afterGB, $word, $reclaimed) -ForegroundColor Green
-        Add-Result 'Space reclaimed' 'OK' ("{0} {1} GB (C: {2}->{3} GB)" -f $word, $reclaimed, $beforeGB, $afterGB)
+        Write-Host ("  {0} free space  {1} GB -> {2} GB  ({3} {4} GB)" -f $script:SysDrive, $beforeGB, $afterGB, $word, $reclaimed) -ForegroundColor Green
+        Add-Result 'Space reclaimed' 'OK' ("{0} {1} GB ({2} {3}->{4} GB)" -f $word, $reclaimed, $script:SysDrive, $beforeGB, $afterGB)
     }
 }
 
@@ -978,7 +1030,7 @@ function Get-DiskSpaceReport {
     $low = @($rows | Where-Object { $_.Status -eq 'LOW' })
     if ($low) {
         foreach ($d in $low) { Write-Host "  LOW SPACE: $($d.Drive) only $($d.'Free%')% free." -ForegroundColor Red }
-        Add-Result 'Disk space' 'OK' (($low | ForEach-Object { "$($_.Drive) $($_.'Free%')%" }) -join ', ')
+        Add-Result 'Disk space' 'Warn' ('LOW: ' + (($low | ForEach-Object { "$($_.Drive) $($_.'Free%')%" }) -join ', '))
     } else {
         Write-Host "  All fixed drives have healthy free space." -ForegroundColor Green
         Add-Result 'Disk space' 'OK' 'all drives healthy'
@@ -999,7 +1051,9 @@ function Get-DirtyBitReport {
             Write-Host "  $($d.DeviceID) clean." -ForegroundColor Green
         }
     }
-    if ($dirty) { Add-Result 'Dirty bit' 'OK' (($dirty -join ', ') + ' DIRTY') }
+    # A dirty volume means Windows suspects corruption and will chkdsk it at next boot --
+    # that is a finding, not a routine 'OK'.
+    if ($dirty) { Add-Result 'Dirty bit' 'Warn' (($dirty -join ', ') + ' DIRTY -- chkdsk at next boot') }
     else        { Add-Result 'Dirty bit' 'OK' 'all clean' }
 }
 
@@ -1054,7 +1108,7 @@ function Get-ConnectivityReport {
     $bad = @($results | Where-Object { $_.Result -match 'NO REPLY|FAILED' })
     if ($bad) {
         Write-Host "  Connectivity issues (ICMP may be filtered -- verify before acting)." -ForegroundColor Yellow
-        Add-Result 'Connectivity' 'OK' ((($bad | ForEach-Object { $_.Check }) -join ', ') + ' failing')
+        Add-Result 'Connectivity' 'Warn' ((($bad | ForEach-Object { $_.Check }) -join ', ') + ' failing (ICMP may be filtered)')
     } else {
         Write-Host "  Network connectivity looks healthy." -ForegroundColor Green
         Add-Result 'Connectivity' 'OK' 'gateway/internet/DNS ok'
@@ -1141,6 +1195,7 @@ function Find-EventIssues {
     $noiseFloor = 5
     $script:Issues = @()
     $script:EventTotals = [ordered]@{}
+    $script:EventScanOk = $false
 
     $all = @()
     foreach ($logName in 'System', 'Application') {
@@ -1149,7 +1204,9 @@ function Find-EventIssues {
         $script:EventTotals[$logName] = $ev.Count
         $all += $ev
     }
-    if (-not $all) { return }
+    # Zero critical/error events in the window is a REAL result (a genuinely quiet
+    # machine), not a failure -- so the scan counts as completed before returning.
+    if (-not $all) { $script:EventScanOk = $true; return }
 
     # Merge provider groups into categories ('Application Error' + '.NET Runtime' both
     # fold into 'App crashes', so the report shows one entry, not two).
@@ -1243,11 +1300,29 @@ function Find-EventIssues {
             @{ Expression = { $rank[$_.Severity] } }, `
             @{ Expression = 'Recent24h'; Descending = $true }, `
             @{ Expression = 'Count'; Descending = $true })
+
+    # Reached the end with everything classified: the analysis is trustworthy. Only now
+    # may the report claim a clean bill of health.
+    $script:EventScanOk = $true
 }
 
 function Get-HealthReport {
     $span = "last $EventDays day$(if ($EventDays -ne 1) { 's' })"
     Write-Section "Report: System health (Event Viewer analysis, $span)"
+
+    # An empty issue list has TWO very different causes: a healthy machine, or a scan that
+    # died before classifying anything. Those must never render the same way. Without this
+    # guard a crashed sweep printed "No notable issues classified. Clean." -- the single
+    # most dangerous sentence this tool could produce, because it is maximally reassuring
+    # and completely unfounded.
+    if (-not $script:EventScanOk) {
+        Write-Host "  EVENT SCAN DID NOT COMPLETE -- no health analysis was performed." -ForegroundColor Red
+        Write-Host "  Do NOT read this as 'clean': nothing was analysed. See the 'Event analysis'" -ForegroundColor Yellow
+        Write-Host "  row in the summary for the underlying error." -ForegroundColor Yellow
+        Add-Result 'Health analysis' 'Failed' 'scan did not complete -- NOT a clean result'
+        return
+    }
+
     foreach ($k in $script:EventTotals.Keys) {
         Write-Host ("  {0,-12}: {1} critical/error events" -f $k, $script:EventTotals[$k]) -ForegroundColor DarkGray
     }
@@ -1272,27 +1347,246 @@ function Get-HealthReport {
             $hint = if ($RepairIssues) { 'auto-repair runs in step 1b' } else { 're-run with -RepairIssues to attempt a safe winget repair' }
             Write-Host "      [safe auto-repair available -- $hint]" -ForegroundColor DarkCyan
         }
-        Add-Result "Issue: $($i.Category)" 'OK' ("{0}; {1} events; {2}; last {3:M/d}" -f $i.Severity, $i.Count, $recentTxt, $i.Last)
+        # Status must reflect the FINDING, not merely that the scan ran. A High-severity
+        # impending-disk-failure issue reading 'OK' in the summary defeats the whole point
+        # of having a summary. High always warns; Medium warns only while it's still
+        # ACTIVE (recent events) -- a Medium with nothing in 24h is already tagged "may
+        # already be resolved", so flagging it would be noise; Low is benign by definition.
+        $status = if ($i.Severity -eq 'High') { 'Warn' }
+                  elseif ($i.Severity -eq 'Medium' -and $i.Recent24h -gt 0) { 'Warn' }
+                  else { 'OK' }
+        Add-Result "Issue: $($i.Category)" $status ("{0}; {1} events; {2}; last {3:M/d}" -f $i.Severity, $i.Count, $recentTxt, $i.Last)
     }
 }
 
-function Get-StartupAudit {
-    Write-Section "Report: Startup programs"
-    # Get-CimInstance, not the deprecated Get-WmiObject (removed in PS7).
-    #
-    # Win32_StartupCommand.Location is either a Startup-folder name or a FULL registry
-    # path -- and the per-user HKU paths embed a raw SID, which is ~50 characters. Under
-    # Format-Table -AutoSize -Wrap that starved the column down to ~8 chars and wrapped it
-    # ONE CHARACTER PER LINE, turning the whole report into unreadable confetti. Collapse
-    # the path to hive + leaf key and clip the command so the table stays legible.
-    Get-CimInstance Win32_StartupCommand | ForEach-Object {
-        $loc = "$($_.Location)"
+# Pull the executable path out of an autostart command line, so we can check whether the
+# file it launches still exists. Autostart commands arrive in every shape Windows permits:
+#   "C:\Program Files\App\app.exe" /background     <- quoted, spaces in path
+#   C:\Windows\SysWOW64\OneDriveSetup.exe /thfirst <- unquoted, trailing args
+#   %windir%\system32\SecurityHealthSystray.exe    <- environment variables
+#   C:\PROGRA~1\SABnzbd\SABnzbd.exe -b0            <- 8.3 short path (Test-Path handles it)
+#   Tautulli.lnk                                   <- Startup-folder entry: NOT a path
+# Returns $null whenever nothing can be resolved CONFIDENTLY. That restraint is the whole
+# point: a guess here turns into a false "this entry is broken" claim in the report, and a
+# false accusation of breakage is worse than staying quiet.
+function Resolve-CommandPath {
+    param([string]$Command)
+    if ([string]::IsNullOrWhiteSpace($Command)) { return $null }
+    $c = [Environment]::ExpandEnvironmentVariables($Command.Trim())
+    $path = $null
+    if ($c.StartsWith('"')) {
+        # Quoted: the path is exactly what sits between the first pair of quotes.
+        $end = $c.IndexOf('"', 1)
+        if ($end -gt 1) { $path = $c.Substring(1, $end - 1) }
+    } else {
+        # Unquoted: stop at the first executable extension. Non-greedy, so an UNQUOTED path
+        # containing spaces still resolves correctly (Windows allows this, sloppily).
+        $m = [regex]::Match($c, '^(.*?\.(exe|com|bat|cmd|scr|dll|msc))(\s|$)', 'IgnoreCase')
+        if ($m.Success) { $path = $m.Groups[1].Value }
+        elseif ($c -notmatch '\s') { $path = $c }
+    }
+    if (-not $path) { return $null }
+    # Only ever judge a ROOTED path. A bare 'Tautulli.lnk' from a Startup folder is
+    # unverifiable without resolving the folder, and calling it "missing" would be wrong.
+    if ($path -notmatch '^[A-Za-z]:\\' -and $path -notmatch '^\\\\') { return $null }
+    return $path
+}
+
+# Collect everything that starts on its own, across all THREE surfaces Windows uses.
+#
+# Win32_StartupCommand -- all this report used to show -- covers only the Run keys and the
+# Startup folders. Measured on a live box: 12 entries there, against 22 non-Windows
+# auto-start SERVICES and 5 non-Microsoft logon/boot SCHEDULED TASKS it never saw. Under a
+# third of reality. That blind spot is not academic: it is precisely why a leftover Ombi
+# service kept running (and logging errors) on a machine whose owner believed it was
+# uninstalled, and why a pair of orphaned ExpressVPN drivers stayed invisible for weeks.
+function Get-AutostartEntries {
+    $entries = @()
+
+    # 1. Run keys + Startup folders.
+    foreach ($s in @(Get-CimInstance Win32_StartupCommand -ErrorAction SilentlyContinue)) {
+        $loc = "$($s.Location)"
+        # HKU paths embed a ~50-character raw SID. Collapse to hive + leaf key, or
+        # Format-Table starves the column and wraps it one character per line.
         if ($loc -match '^(HK[A-Z_]+)\\.*\\([^\\]+)$') { $loc = "$($Matches[1])\...\$($Matches[2])" }
-        $cmd = "$($_.Command)"
-        if ($cmd.Length -gt 70) { $cmd = $cmd.Substring(0, 67) + '...' }
-        [pscustomobject]@{ Name = $_.Name; Location = $loc; Command = $cmd }
+        $entries += [pscustomobject]@{
+            Type = 'Run/Startup'; Name = "$($s.Name)"; Source = $loc; Command = "$($s.Command)"
+        }
+    }
+
+    # 2. Auto-start services, minus the in-box ones. Without that filter ~200 Windows
+    # services drown the signal; third-party services are what a maintenance pass is for.
+    foreach ($svc in @(Get-CimInstance Win32_Service -Filter "StartMode='Auto'" -ErrorAction SilentlyContinue)) {
+        $p = "$($svc.PathName)"
+        if ($p -match '\\Windows\\(System32|SysWOW64|servicing)\\') { continue }
+        $entries += [pscustomobject]@{
+            Type = 'Service'; Name = "$($svc.Name)"; Source = "svc: $($svc.State)"; Command = $p
+        }
+    }
+
+    # 3. Scheduled tasks triggered at logon or boot, excluding Microsoft's own tree.
+    # ScheduledTasks is a CDXML module, so a broken CIM proxy fails during module AUTO-LOAD
+    # -- before the cmdlet's own -ErrorAction can help. That is the exact trap that once
+    # broke the DNS report, so import it explicitly and let our own catch handle it.
+    try {
+        Import-Module ScheduledTasks -ErrorAction Stop
+        foreach ($t in @(Get-ScheduledTask -ErrorAction SilentlyContinue)) {
+            if ($t.State -eq 'Disabled') { continue }
+            if ("$($t.TaskPath)" -like '\Microsoft\*') { continue }
+            $trig = @($t.Triggers | Where-Object { "$($_.CimClass.CimClassName)" -match 'LogonTrigger|BootTrigger' })
+            if (-not $trig) { continue }
+            # A task's Execute value is sometimes ALREADY quoted. Concatenating it raw
+            # produced '""C:\path\x.exe" args', whose first quote pair encloses nothing --
+            # Resolve-CommandPath then found an empty path and gave up, silently skipping
+            # the existence check. Strip the quotes so the path is plain before we rebuild.
+            $act  = @($t.Actions | Where-Object { $_.Execute })
+            $cmd  = ''
+            if ($act) {
+                $exe = "$($act[0].Execute)".Trim().Trim('"')
+                $cmd = ("$exe $($act[0].Arguments)").Trim()
+            }
+            $when = if ("$($trig[0].CimClass.CimClassName)" -match 'Boot') { 'at boot' } else { 'at logon' }
+            $entries += [pscustomobject]@{
+                Type = 'Task'; Name = "$($t.TaskName)"; Source = $when; Command = $cmd
+            }
+        }
+    } catch {
+        Write-Warning "Scheduled tasks could not be enumerated: $(($_.Exception.Message -split "`r?`n")[0])"
+        Write-Host "  (Autostart audit below therefore covers Run keys + services only.)" -ForegroundColor DarkGray
+    }
+    return $entries
+}
+
+function Get-StartupAudit {
+    Write-Section "Report: Autostart audit (Run keys, services, scheduled tasks)"
+    $entries = @(Get-AutostartEntries)
+    if (-not $entries) {
+        Write-Warning "Could not enumerate any autostart entry."
+        Add-Result 'Autostart audit' 'Failed' 'no entries enumerated'
+        return
+    }
+
+    # Resolve each command to a real file and test it. An autostart entry pointing at a file
+    # that is GONE is classic partial-uninstall residue: the app was removed, its launch
+    # point survived. A $null path means "unverifiable", which is NOT the same as broken.
+    foreach ($e in $entries) {
+        $p = Resolve-CommandPath $e.Command
+        $miss = $false
+        if ($p) { $miss = -not (Test-Path -LiteralPath $p -ErrorAction SilentlyContinue) }
+        Add-Member -InputObject $e -NotePropertyName 'ExePath' -NotePropertyValue $p -Force
+        Add-Member -InputObject $e -NotePropertyName 'Missing' -NotePropertyValue $miss -Force
+    }
+
+    foreach ($grp in @('Run/Startup', 'Service', 'Task')) {
+        $rows = @($entries | Where-Object { $_.Type -eq $grp })
+        if (-not $rows) { continue }
+        $label = switch ($grp) {
+            'Run/Startup' { 'Run keys + Startup folders' }
+            'Service'     { 'Auto-start services (non-Windows)' }
+            'Task'        { 'Scheduled tasks at logon/boot (non-Microsoft)' }
+        }
+        Write-Host ""
+        Write-Host "  $label  [$($rows.Count)]" -ForegroundColor Cyan
+        $rows | ForEach-Object {
+            [pscustomobject]@{
+                '!'     = $(if ($_.Missing) { 'X' } else { '' })
+                Name    = Format-EventToken $_.Name 34
+                Source  = Format-EventToken $_.Source 22
+                Command = Format-EventToken $_.Command 58
+            }
+        } | Format-Table -AutoSize
+    }
+
+    $missing = @($entries | Where-Object { $_.Missing })
+    Write-Host ""
+    if ($missing) {
+        Write-Host "  BROKEN AUTOSTART ENTRIES -- these point at files that no longer exist:" -ForegroundColor Yellow
+        foreach ($m in $missing) {
+            Write-Host ("    [{0}] {1}" -f $m.Type, (Format-EventToken $m.Name 40)) -ForegroundColor Yellow
+            Write-Host ("        missing : {0}" -f $m.ExePath) -ForegroundColor DarkGray
+            Write-Host ("        from    : {0}" -f (Format-EventToken $m.Source 60)) -ForegroundColor DarkGray
+        }
+        Write-Host "  Usually leftovers from an incomplete uninstall. Removal is safe but left MANUAL:" -ForegroundColor DarkGray
+        Write-Host "    Run keys -> Task Manager > Startup    services -> sc.exe delete <name>" -ForegroundColor DarkGray
+        Write-Host "    tasks    -> Task Scheduler (taskschd.msc)" -ForegroundColor DarkGray
+        Add-Result 'Autostart audit' 'Warn' ("{0} entries; {1} point at MISSING files" -f $entries.Count, $missing.Count)
+    } else {
+        Write-Host "  $($entries.Count) autostart entries; every resolvable one points at a file that exists." -ForegroundColor Green
+        Add-Result 'Autostart audit' 'OK' ("{0} entries; none broken" -f $entries.Count)
+    }
+}
+
+# Decode Win32_PnPEntity.ConfigManagerErrorCode -- the CM_PROB_* value that Device Manager
+# renders as a yellow bang. Text kept plain-English rather than echoing the raw constant.
+function Convert-DeviceErrorCode {
+    param([int]$Code)
+    $map = @{
+        1  = 'not configured correctly'
+        3  = 'driver corrupted, or out of memory'
+        9  = 'firmware reported the device incorrectly'
+        10 = 'cannot start'
+        12 = 'not enough free resources'
+        14 = 'needs a restart to work'
+        16 = 'resources not fully identified'
+        18 = 'drivers need reinstalling'
+        19 = 'registry configuration incomplete or damaged'
+        21 = 'being removed'
+        22 = 'disabled'
+        24 = 'not present, not working, or missing drivers'
+        28 = 'drivers not installed'
+        31 = 'driver failed to load'
+        33 = 'hardware not responding / resource conflict'
+        43 = 'Windows stopped it after it reported a problem'
+        45 = 'not currently connected (leftover device node)'
+    }
+    if ($map.ContainsKey($Code)) { return $map[$Code] }
+    return "problem code $Code"
+}
+
+function Get-DeviceHealthReport {
+    Write-Section "Report: Device health (Device Manager problems)"
+    # A non-zero ConfigManagerErrorCode is EXACTLY what puts a yellow bang next to a device
+    # in Device Manager. This reads Windows' own verdict rather than inferring one, which is
+    # what keeps the check honest: it cannot false-positive any more than Device Manager can.
+    # Report-only by design -- removing a device node (pnputil /remove-device) is a separate
+    # decision, not something a routine maintenance pass should do behind your back.
+    $all = $null
+    try { $all = @(Get-CimInstance Win32_PnPEntity -ErrorAction Stop) }
+    catch {
+        $why = ($_.Exception.Message -split "`r?`n")[0]
+        Write-Warning "Could not enumerate PnP devices: $why"
+        Add-Result 'Device health' 'Failed' $why
+        return
+    }
+    $bad = @($all | Where-Object { $null -ne $_.ConfigManagerErrorCode -and $_.ConfigManagerErrorCode -ne 0 })
+    # Code 22 = the user DISABLED this device deliberately. That is a choice, not a fault --
+    # warning on it would be noise. Count it separately, never flag it.
+    $disabled = @($bad | Where-Object { $_.ConfigManagerErrorCode -eq 22 })
+    $faulty   = @($bad | Where-Object { $_.ConfigManagerErrorCode -ne 22 })
+
+    if (-not $faulty) {
+        Write-Host "  All $($all.Count) present devices report healthy." -ForegroundColor Green
+        if ($disabled) { Write-Host "  ($($disabled.Count) device(s) deliberately disabled -- not a fault.)" -ForegroundColor DarkGray }
+        Add-Result 'Device health' 'OK' "$($all.Count) devices, none faulty"
+        return
+    }
+
+    $faulty | ForEach-Object {
+        [pscustomobject]@{
+            Device   = Format-EventToken "$($_.Name)" 42
+            Code     = $_.ConfigManagerErrorCode
+            Problem  = Convert-DeviceErrorCode ([int]$_.ConfigManagerErrorCode)
+            DeviceID = Format-EventToken "$($_.PNPDeviceID)" 28
+        }
     } | Format-Table -AutoSize
-    Add-Result 'Startup audit' 'OK'
+
+    Write-Host "  These appear as yellow warning icons in Device Manager (devmgmt.msc)." -ForegroundColor Yellow
+    Write-Host "  Usual fixes: update or reinstall the driver. If the device belongs to software" -ForegroundColor DarkGray
+    Write-Host "  you already uninstalled, it is a leftover node -- remove it in Device Manager" -ForegroundColor DarkGray
+    Write-Host "  (View > Show hidden devices > right-click > Uninstall device)." -ForegroundColor DarkGray
+    if ($disabled) { Write-Host "  ($($disabled.Count) further device(s) deliberately disabled -- not counted.)" -ForegroundColor DarkGray }
+    $names = (($faulty | Select-Object -First 3) | ForEach-Object { Format-EventToken "$($_.Name)" 26 }) -join ', '
+    Add-Result 'Device health' 'Warn' ("{0} device(s) in error: {1}" -f $faulty.Count, $names)
 }
 
 function Get-PowerReport {
@@ -1341,7 +1635,9 @@ function Get-PendingRebootReport {
     if ($pending.Count -gt 0) {
         Write-Host "  REBOOT PENDING -- restart to finish:" -ForegroundColor Yellow
         $pending | ForEach-Object { Write-Host "    - $_" -ForegroundColor Yellow }
-        Add-Result 'Pending reboot' 'OK' ('YES: ' + ($pending -join '; '))
+        # A pending reboot means the run is NOT actually finished -- chkdsk /f /r, DISM and
+        # -NetworkReset all defer their real work to next boot. Warn so it can't be missed.
+        Add-Result 'Pending reboot' 'Warn' ('YES: ' + ($pending -join '; '))
     } else {
         Write-Host "  No reboot pending." -ForegroundColor Green
         Add-Result 'Pending reboot' 'OK' 'none'
@@ -1427,7 +1723,8 @@ try {
     Invoke-Step 'DNS report'        { Get-NetworkReport }
     Invoke-Step 'Connectivity'      { Get-ConnectivityReport }
     Invoke-Step 'Health report'     { Get-HealthReport }
-    Invoke-Step 'Startup audit'     { Get-StartupAudit }
+    Invoke-Step 'Autostart audit'   { Get-StartupAudit }
+    Invoke-Step 'Device health'     { Get-DeviceHealthReport }
     Invoke-Step 'Power report'      { Get-PowerReport }
     Invoke-Step 'Pending reboot'    { Get-PendingRebootReport }
 
@@ -1436,11 +1733,22 @@ try {
     # -Wrap: the Detail column carries the actionable text (exit codes, skip reasons).
     # Without it Format-Table truncates mid-sentence on a narrow console.
     $script:Results | Format-Table -AutoSize -Wrap
-    $failed = $script:Results | Where-Object { $_.Status -eq 'Failed' }
-    if ($failed) {
+    # Two INDEPENDENT questions, and the summary must answer both:
+    #   Failed = a step did not do its job (a tool problem).
+    #   Warn   = a step worked fine and FOUND something wrong with the machine.
+    # A run can be entirely Failed-free and still have a failing disk. @() guards the
+    # .Count on a single result.
+    $failed = @($script:Results | Where-Object { $_.Status -eq 'Failed' })
+    $warned = @($script:Results | Where-Object { $_.Status -eq 'Warn' })
+    if ($failed.Count -gt 0) {
         Write-Host "$($failed.Count) step(s) FAILED -- review above and the transcript." -ForegroundColor Red
-    } else {
-        Write-Host "All steps completed without hard failures." -ForegroundColor Green
+    }
+    if ($warned.Count -gt 0) {
+        Write-Host "$($warned.Count) finding(s) NEED ATTENTION (status 'Warn'):" -ForegroundColor Yellow
+        foreach ($w in $warned) { Write-Host "    - $($w.Step): $($w.Detail)" -ForegroundColor Yellow }
+    }
+    if ($failed.Count -eq 0 -and $warned.Count -eq 0) {
+        Write-Host "All steps completed, and nothing needs your attention." -ForegroundColor Green
     }
     # Format hours EXPLICITLY. '{0:mm}' is the minutes-within-the-hour component, so it
     # silently drops whole hours: a real 1h01m59s run printed as "01m 59s". A -DeepClean
