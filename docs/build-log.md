@@ -1,0 +1,410 @@
+# Build log — pc-tuneup
+
+Full development history: every milestone, every defect found, and the reasoning
+behind each fix. **Not loaded by default — read on demand.**
+
+## Why this file exists
+
+Split out of `CLAUDE.md` on 2026-08-21. That file had reached **37 KB across 462
+lines**, and 82% of it was this section: an append-only record of build milestones
+that never moved out once completed. Claude Code warns above ~40 KB, so it was
+close to the point where it would start costing on every session.
+
+`CLAUDE.md` keeps the durable rules, the commands, the close-out gate, and what is
+genuinely still open. Everything finished lives here.
+
+Same pattern already used elsewhere in `repos\`: `jarvis` keeps `docs/milestones/`,
+`command-center` keeps `sessions/`, `job-search` keeps `search-log.md`. None of them
+auto-load.
+
+## How to use it
+
+Grep it when you need the history of a decision, why a guard exists, or whether a
+failure mode has been seen before. **Nothing here was deleted** — entries are
+preserved exactly as written, including ones later superseded.
+
+⚠️ **Status here may be stale.** `CLAUDE.md` is authoritative for what is open.
+
+---
+
+## Milestones — as split on 2026-08-21
+
+- [x] Verified command spec written (in command-center, 2026-06-07)
+- [x] Full script built: self-elevation, transcript, all guards, report, param surface (2026-06-07)
+- [x] Static parse clean; Get-WinEvent + winget claims smoke-tested (2026-06-07)
+- [x] Build-out: System Restore checkpoint (step 0), free-space-reclaimed reporting,
+      pending-reboot report; fixed -DryRun violation (DNS flush now gated) (2026-06-07)
+- [x] Integration smoke test under real Windows PowerShell 5.1 (26100): AST-loaded the
+      shipped function bodies, ran all read-only reports + DryRun gating on this box.
+      DryRun contract verified; pending-reboot correctly caught a live file-rename marker (2026-06-07)
+- [x] Published to GitHub (private): github.com/samonti86/pc-tuneup; origin/master tracked (2026-06-07)
+- [x] Crash-loop detection (always-on, read-only) + opt-in -RepairCrashLoops (targeted
+      winget repair/upgrade, skip-if-ambiguous). Filters on the 'Application Error'
+      PROVIDER, not just Event ID 1000 (podman et al. reuse that ID). Decodes exception
+      codes. Found ExpressVPN.BrowserHelper.exe crash-looping 355x/7d, 0xE0434352/.NET (2026-06-07)
+- [x] First real ELEVATED end-to-end run (2026-06-07): restore point, DISM/SFC clean,
+      chkdsk clean, TRIM, 2.21 GB reclaimed, PSWindowsUpdate installed a driver. Surfaced
+      a bug -> fixed: temp cleanup wiped $env:TEMP wholesale, deleting the live session's
+      CDXML/CIM module proxies, which broke Clear-DnsClientCache (first-loaded post-cleanup).
+      Fix: delete only >24h-old temp + preserve remoteIpMoProxy_*; harden DNS report with
+      try/catch (module-LOAD errors bypass -EA SilentlyContinue). Validated under 5.1 (2026-06-07)
+- [x] 2nd elevated run (under pwsh 7.6) post-mortem: Defender + DNS silently no-op'd and
+      were MISREPORTED (Defender "Skipped/3rd-party AV?", DNS false "OK"). Root cause: the
+      ORIGINAL pre-fix wholesale $env:TEMP wipe poisoned PowerShell's persisted
+      module-analysis cache (it referenced a deleted remoteIpMoProxy_*..._94a5a24c proxy);
+      that stale state carried into the next run, so CDXML modules (DnsClient, ConfigDefender)
+      failed to autoload mid-run. Machine has since SELF-HEALED (fresh PS7/5.1 sessions load
+      both fine). Fixes: (1) Invoke-Defender now CALLS Get-MpComputerStatus and distinguishes
+      absent (Skipped) vs load-error (Failed) -- never a silent skip; (2) Get-NetworkReport
+      explicitly Import-Module DnsClient first so a load failure is caught on a command we own
+      and reported as Skipped, not false OK. Verified under 5.1 AND 7.6 (2026-06-07)
+- [x] Defender engine-state refinement: this box runs MALWAREBYTES as the primary AV, so
+      Get-MpComputerStatus reports AMServiceEnabled=$false / AMRunningMode='Not running'
+      (Defender stood down -- stronger than passive). On-demand Start-MpScan can't run with
+      a stopped engine, so Invoke-Defender now checks the engine state and reports an accurate
+      'Skipped: engine inactive; another AV is primary' (not a guess, not a Failed). Corrects
+      the earlier wrong expectation that the next run would scan. Verified 5.1+7.6 (2026-06-07)
+- [x] Deep-dive QA pass (2026-06-07): added Invoke-Step so a single unhandled throw can no
+      longer abort the remaining steps + summary (biggest robustness gap); winget exit code
+      now captured in Update-Apps (Partial vs false OK); log retention (keep last 30 of each
+      artifact); power/battery reports moved into the log dir, timestamped (declutter $USERPROFILE);
+      reclaimed-space labels negative deltas as "net change"; fixed 2 empty catch blocks. Added
+      PSScriptAnalyzerSettings.psd1 (3 documented rule exclusions) -> PSSA now CLEAN. Verified
+      parse + PSSA-clean + Invoke-Step isolation under 5.1 AND 7.6 (2026-06-07)
+- [x] Confirmed clean elevated run (tuneup-2026-06-07-202952): DNS flush EXECUTED, Defender
+      correctly Skipped (engine inactive/Malwarebytes), no Failed steps -- both prior fixes
+      validated in production (2026-06-07)
+- [x] Generalized crash-loop -> Event Viewer HEALTH ANALYZER (2026-06-08): one sweep of
+      System+Application (Crit+Error, 7d), classified against a knowledge-base of ~15 issue
+      types (disk/WHEA/shutdown=High; app+service crashes/VSS/WU=Medium; DCOM/TPM/cert/Hyper-V
+      =Low) with severity + named culprits + SAFE recommendation each. Only auto-repair is the
+      winget app-repair (opt-in, now -RepairIssues; alias -RepairCrashLoops); everything else is
+      recommend-only by design (most event issues have no safe generic fix). Replaced
+      Get-EventSummary+Find-CrashLoops+Get-CrashLoopReport with Get-IssueKnowledgeBase/
+      Resolve-IssueRule/Find-EventIssues/Get-HealthReport. Repair dedupes by winget id. Verified
+      against live logs + parse + PSSA-clean under 5.1 AND 7.6 (2026-06-08)
+- [x] Capability expansion (2026-06-08): + Sync-SystemClock (w32tm /resync, step 8 -- drift
+      breaks SSL/auth); + reports Get-DiskSpaceReport (low-space warn), Get-DirtyBitReport
+      (fsutil dirty query -> pending boot chkdsk), Get-ComponentStoreReport (DISM AnalyzeComponent-
+      Store size + cleanup-recommended), Get-ConnectivityReport (gateway/1.1.1.1/DNS via pure
+      .NET, no CDXML dep); + opt-in -EmptyRecycleBin and -ResetStore (wsreset). Deliberately
+      EXCLUDED registry cleaners / auto driver updates / service-debloat (unsafe snake-oil).
+      Added PSAvoidUsingComputerNameHardcoded to PSSA exclusions (1.1.1.1 probe is intentional).
+      Verified on live box + parse + PSSA-clean under 5.1 AND 7.6 (2026-06-08)
+- [x] Two bug fixes from a -DeepClean -NetworkReset run (2026-06-08): (1) 'netsh int ip reset'
+      returns exit 1 + "Access is denied" on ONE ACL-locked NSI registry key (HKLM\...\Nsi\...)
+      that Windows blocks even for elevated admin/SYSTEM -- the rest of the stack still resets.
+      Reset-NetworkStack now captures the output and reports Partial (benign) when it ran but
+      only ACL-locked keys were denied, instead of a hard Failure. Deliberately do NOT take key
+      ownership (risky ACL surgery, no benefit). (2) powercfg /output path was wrapped in manual
+      quotes ("`"$path`""), so the native exe saw a leading '"', treated the absolute path as
+      RELATIVE, and prepended the cwd -- mislocating the energy/battery report. Fixed by passing
+      the bare path (PS auto-quotes native args with spaces). Parse + PSSA-clean; netsh classifier
+      verified against the real log output (2026-06-08)
+- [x] Health-report RECENCY (2026-06-08, user feedback): stale events (e.g. crashes from an app
+      since uninstalled) cluttered the 7d view with no way to tell active from resolved. Added
+      per-issue first/last-seen timestamps + a "last 24h" count + a "(no activity in last 24h --
+      may already be resolved)" tag; sort is now severity -> recent-active -> volume so live issues
+      bubble up. New -EventDays N param (default 7, 1-365) narrows the window. Verified on live
+      logs 5.1+7.6: App crashes (ExpressVPN, uninstalled) correctly tagged stale/0-recent; Service
+      crashes 40-in-24h sorted above it; -EventDays 1 drops the stale categories (2026-06-08)
+- [x] ExpressVPN post-uninstall investigation (2026-06-08): the ~40 service crashes "in last 24h"
+      were REAL but PRE-uninstall -- 7031 crashes 11:40-11:55 AM, user uninstalled ~2:08 PM (7040
+      events), tuneup ran 2:19 PM, so this morning's crashes were still inside the 24h window. Win32
+      services genuinely gone (Get-Service none). BUT uninstall left 2 orphaned KERNEL DRIVERS still
+      RUNNING: expressvpntun + tapexpressvpn (Type=1, Start=manual) -- invisible in services.msc
+      (drivers, not services). No leftover Run keys / scheduled tasks / install folders. User action:
+      'sc.exe stop/delete expressvpntun tapexpressvpn' then reboot (already pending from chkdsk /f /r)
+- [x] End-to-end proofread + public-repo documentation pass (2026-08-03). Full read of all
+      1170 lines looking for correctness bugs. Found and fixed 4 real ones + 3 hygiene:
+      (1) SELF-ELEVATION DROPPED VALUE PARAMS -- the forwarding loop only re-passed
+      switches (`$kv.Value -is [switch] -and .IsPresent`), so `-EventDays 1` from a
+      non-elevated prompt silently reverted to the default 7 in the elevated child. No
+      error, just wrong behavior. Now forwards name+value for non-switch params (quoting
+      values containing whitespace) and skips a hand-passed -Relaunched to avoid a
+      duplicate-parameter bind error. Verified with 4 cases incl. the exact bug.
+      (2) DISM EXIT 3010 = ERROR_SUCCESS_REBOOT_REQUIRED was reported FAILED -- Invoke-Native
+      only accepted 0, so a successful RestoreHealth/StartComponentCleanup needing a reboot
+      looked like a hard failure (same false-failure class as the netsh fix). Both DISM call
+      sites now pass -SuccessCodes @(0,3010); Invoke-Native labels 3010 'success; reboot
+      required'. Verified via `cmd /c exit 3010`.
+      (3) chkdsk /f /r scheduling never checked $LASTEXITCODE -- flat 'OK' even if scheduling
+      failed, promising a boot-time check that would never run. Now Partial + warning on
+      non-zero (pending-reboot report is the cross-check).
+      (4) TRANSCRIPT HIJACK -- if the caller already had a transcript running, Start-Transcript
+      errored and the unconditional Stop-Transcript in `finally` tore down THEIR transcript.
+      Now tracks $script:TranscriptStarted and only stops its own; warns + continues if it
+      can't log.
+      Hygiene: @() guard in Get-WingetIdFromListing (single surviving line -> bare [string]
+      broke [array]::IndexOf); Detail fallback so an app-crash category built only from hangs
+      (1002)/.NET Runtime events can't render a blank line; summary Format-Table -Wrap so the
+      Detail column stops truncating; numbered the 2 unnumbered sections (Recycle Bin -> 6b,
+      Store -> 11) so printed headers run 0..11 and docs can mirror them exactly.
+      UX: added internal -Relaunched switch -- the UAC-spawned window used to slam shut on
+      completion, taking the whole report with it; it now pauses on Enter. Gated so an
+      already-elevated/scheduled run never blocks on input.
+      NOT changed (deliberate): w32tm `/resync /force` -- suspected invalid, but empirically
+      w32tm ACCEPTS /force (an invalid flag like /bogusflag fails with 0x80070057, /force
+      doesn't). Left as-is. Also left: script still returns exit 0 even when steps fail
+      (documented as a known limitation in README rather than silently changing behavior).
+      Verified: parse OK 5.1 + 7.6, PSSA clean, AST-loaded smoke test of every changed path.
+- [x] README rewritten as a public-repo front door (2026-08-03): TOC, requirements, install
+      (incl. Unblock-File), quick start, step-by-step table matching the script's printed
+      numbering, always-on report table, health-analysis anatomy with an ILLUSTRATIVE
+      (not real-machine -- repo is public) example, full param table, 9 copy-paste recipes,
+      status-code glossary, logs + PRIVACY warning (logs name drives/apps/DNS/startup --
+      review before pasting into an issue), safety model + explicit "will not do" list,
+      11-entry FAQ, scheduled-task recipe, compatibility (incl. PS7 Checkpoint-Computer
+      caveat + non-English parsing caveat), dev/sanity-gate section.
+- [x] FIRST FULL ELEVATED RUN OF THE PROOFREAD BUILD (2026-08-04, tuneup-2026-08-03-160954):
+      `-DeepClean -FlushUpdateCache -NetworkReset -RepairIssues -ResetStore` on Win11 26200.
+      Validated in production: 6b/11 numbering, DISM 3010 handling, netsh Partial classifier,
+      Defender engine-inactive skip, restore point, 10.64 GB reclaimed by /ResetBase. The new
+      chkdsk exit-code check EARNED ITS KEEP -- caught `chkdsk /f /r` exiting 3 (would have
+      been a silent false 'OK' before). 3 new bugs found from the real output + fixed:
+      (1) ELAPSED TIME DROPPED WHOLE HOURS. '{0:mm}' is the minutes-WITHIN-HOUR component, so
+      the 62-minute run printed "Elapsed: 01m 59s". Confirmed by log file span (16:09:54 ->
+      17:11:54 = 62 min) and by formatting a 3719s TimeSpan. Now formats hours explicitly AND
+      times with a MONOTONIC [Diagnostics.Stopwatch] instead of Get-Date subtraction -- the
+      script resyncs the clock itself at step 10, so wall-clock deltas are self-corruptible
+      (CLOCK_MONOTONIC vs CLOCK_REALTIME). NOTE: investigated whether the clock actually
+      jumped mid-run -- it did NOT (Kernel-General id 1 shows only a 2ms delta at 17:51,
+      after the run). The hypothesis was wrong; the run really did take 62 min.
+      (2) chkdsk /f /r piped its output to Out-Null, discarding the ONLY evidence of why it
+      exited 3. Now captures + prints it, and -- more importantly -- VERIFIES the end state
+      with `chkntfs C:` instead of inferring from the exit code (an exit code is a claim;
+      chkntfs is the actual scheduled state). Reports Failed + the manual command when no
+      check is really scheduled.
+      (3) STARTUP AUDIT WAS UNREADABLE: Win32_StartupCommand.Location embeds a ~50-char raw
+      SID for HKU entries; Format-Table -AutoSize -Wrap starved the column to ~8 chars and
+      wrapped it ONE CHARACTER PER LINE. Now collapses to hive+leaf ('HKU\...\Run') and clips
+      the command; verified against this box's 12 startup entries.
+      Also: Windows Update now reports update COUNT ('none available' vs 'N update(s)') --
+      previously a no-op and a real install both rendered as a bare 'OK' with an empty body.
+      README timing corrected (a -DeepClean pass measured at just over an hour, not 20-45 min).
+      Machine findings (not script bugs): WSearch crash-loop is REAL and actionable --
+      Microsoft-Windows-Search 3602/7042 x8 each ("Recovery phase failed", 0x80040d23,
+      "please recreate the index") + WSearch 7031/7023 x12 ("A specified logon session does
+      not exist") = corrupt SystemIndex catalog; the tool's own advice (rebuild the index) is
+      the right fix. ESENT 902 x66 is NOT search-related (hypothesis was wrong): it's Unistore
+      (Mail/Calendar/People sync DB) reporting "multiple threads illegally using the same
+      database session" -- a Microsoft-internal threading defect, benign, not user-fixable.
+      Verified: parse OK 5.1, PSSA clean, AST-loaded smoke test of all 3 fixes.
+- [x] chkdsk /f /r SCHEDULING ACTUALLY FIXED (2026-08-04, user-driven: they want -DeepClean
+      usable on OTHER people's machines -- friends' PCs, possible spinning disks where /r's
+      bad-sector surface scan is the whole point -- so "fails honestly" wasn't good enough).
+      Root cause, found by empirical elimination on the live box:
+      (1) FIRST HYPOTHESIS WRONG: guessed the output redirection (`| Out-Null`) suppressed
+      chkdsk's "schedule at next restart? (Y/N)" prompt. Removing it DID restore the prompt --
+      but chkdsk then asked THREE TIMES and aborted, still scheduling nothing. So redirection
+      was a red herring; the piped answer was never consumed.
+      (2) ACTUAL CAUSE: a PowerShell pipeline does NOT satisfy that prompt. `'Y' | chkdsk.exe
+      C: /f /r` leaves it unanswered (3 re-prompts, nothing scheduled). `cmd.exe /c
+      "echo y|chkdsk C: /f /r"` answers it correctly -> "This volume will be checked the next
+      time the system restarts" + chkntfs confirms "scheduled manually to run on next reboot".
+      Fix = let CMD do the piping. DO NOT "simplify" it back to a native PS pipe.
+      (3) BONUS TRAP: chkdsk returns EXIT 3 EVEN WHEN SCHEDULING SUCCEEDS. Measured exit 3
+      both when nothing was scheduled AND when chkntfs then confirmed it was. The exit code
+      carries zero signal here -- so the code now IGNORES it entirely and reports purely on
+      the chkntfs-verified end state (Partial if chkntfs itself returns nothing). This is the
+      strongest vindication yet of the project's verify-the-end-state-over-the-return-code rule.
+      Deliberately NOT done: writing BootExecute (`autocheck autochk /r \??\C:`) directly. It
+      was the fallback plan for a true /r if cmd failed, but the safe documented path works,
+      so no registry surgery in the boot path -- holds the project's conservative line.
+      README: step-4 row documents the chkntfs verification; new FAQ entry "Did the boot-time
+      chkdsk actually run?" (chkntfs before, Wininit 1001 in the Application log after,
+      `chkntfs /x C:` to cancel); -DeepClean row warns /r reads every sector and can take
+      HOURS on a large spinning disk with the machine unusable at the boot screen.
+- [x] Windows Search root-caused (2026-08-04): WSearch has crashed ~1x/day for the FULL 60-day
+      log retention, always 21-22s after a system start, never mid-session -- a deterministic
+      STARTUP RACE (7023 "A specified logon session does not exist"), not index corruption.
+      That is why the user's repeated index rebuilds never stuck: a rebuild cannot fix a
+      timing problem. Suggested `sc.exe config WSearch start= delayed-auto` as the reversible
+      mitigation. SEPARATELY found a stale crawl scope pointing at `file:///E:\[38115ef8-...]`
+      (drive absent; only C: and an empty D: exist) present in BOTH WorkingSetRules AND
+      DefaultRules -- DefaultRules is the baseline re-applied on every rebuild, so it outlived
+      every rebuild. User removed it via Indexing Options (it renders as a GUID folder marked
+      "not available" because the volume is unmounted). NOTE: hypothesis that E:\ CAUSED the
+      boot crash was DISPROVEN -- its error (id 1019) fired once in 30 days, during the
+      rebuild, never at a boot crash. Two independent problems, not one.
+      Also disproven this session: ESENT 902 x66 is Unistore (Mail/Calendar/People sync DB)
+      reporting a Microsoft-internal threading defect -- unrelated to Search, not user-fixable.
+- [x] FIRST WINDOWS 10 RUN (2026-08-04, Win10 22H2 / 19045, PS 5.1 Desktop):
+      `-DeepClean -NetworkReset -RepairIssues -FlushUpdateCache`. Cross-version core all
+      ported clean -- cmd-piped chkdsk /f /r scheduling + chkntfs verification, netsh
+      Partial classifier, DISM 3010, elapsed formatting, update-count reporting; Defender
+      actually ran a QuickScan here (Win11 box has Malwarebytes primary, so this was the
+      first real exercise of that path). 2 steps FAILED + 1 silently vanished -> 5 bugs
+      found and fixed:
+      (1)+(2) SAME ROOT CAUSE. Ombi (ASP.NET Core) uses the EventLog logging provider
+      without setting a SourceName, so it inherits the SHARED '.NET Runtime' event source
+      and writes its OWN ILogger EventId -- which is 1000. The app-crash extractor filtered
+      on `$_.Id -eq 1000` ALONE, so it read those as Application Error records, and
+      Properties[0] (the exe name for a real crash) was instead Ombi's entire multi-line
+      log message. That both dumped ~40 lines of stack trace into the report AND crashed
+      step 1b when the blob reached [IO.Path]::GetFileNameWithoutExtension().
+      >>> THE LESSON: that API THROWS "Illegal characters in path" on .NET Framework (5.1)
+      and SILENTLY ACCEPTS the same input on .NET Core (7.x). Verifying under both 5.1 and
+      7.6 does NOT protect you here -- the bug is INVISIBLE under 7 and only detonates on
+      5.1, the shipping target. Treat "works in pwsh" as no evidence at all for this class.
+      Fixes: $appErr now provider-scoped to 'Application Error' (Event-ID-1000 collision,
+      same trap as podman one layer deeper); new Test-PlausibleFileName guard so
+      Resolve-WingetId DECLINES rather than throws; new Format-EventToken collapses/clips
+      any event string before it reaches the report; KB rule split so '.NET Runtime'
+      1023/1026/1027 stays 'App crashes' while everything else becomes a new Low-severity
+      'App error logs (.NET)' category whose advice points at app config, not Windows tools.
+      (3) STEP 5 SILENTLY VANISHED FROM THE SUMMARY -- the worst failure mode this tool has.
+      Get-Volume failed (broken Storage WMI provider, see below), $volumes came back empty,
+      the foreach had nothing to iterate, and NO Add-Result ever ran. Not Failed, not
+      Skipped: absent. Optimize-Drives now derives the system drive from $env:SystemDrive
+      (so the DEFAULT path needs no WMI at all), falls back to Win32_LogicalDisk then to
+      `defrag.exe /O`, and ALWAYS records an outcome.
+      (4) Get-PhysicalDisk was outside any try/catch. Note its error surfaced from the
+      ENUMERATOR ("Exception calling MoveNext"), i.e. terminating mid-pipeline -- so
+      -ErrorAction SilentlyContinue would NOT have saved it either. Now falls back to
+      Win32_DiskDrive (classic CIMv2, unaffected) and reports Partial.
+      (5) Service-crash culprits read Properties[0] unconditionally, but SCM puts the
+      service name at [1] on the two TIMEOUT events (7009/7011) where [0] is the timeout in
+      ms -- so the top culprit rendered as "30000" and the same service was counted twice.
+      New Get-EventServiceName picks the index by event id. Verified against real SCM
+      events on the Win11 box.
+      Verified: parse OK 5.1 + pwsh, PSSA clean, AST-loaded smoke tests of every fix under
+      5.1 SPECIFICALLY (incl. shadowing Get-Volume/Get-CimInstance to simulate the Win10
+      C/D/M/T layout and the broken-provider path).
+- [x] Step 5 scoped to the SYSTEM DRIVE by default + new opt-in `-OptimizeAllDrives`
+      (2026-08-04, user decision). The Win10 box has 33 TB and 22 TB fixed volumes attached;
+      once bug (3) was fixed, step 5 would have started actually optimizing them -- a
+      potentially multi-hour defrag inside a routine that otherwise takes ~15 min, which is
+      unacceptable on someone else's PC. Non-system drives still get a `Skipped` summary row
+      (what we did NOT touch is part of an honest report).
+- [ ] Machine findings from the Win10 box (NOT script bugs, tracked so they aren't lost):
+      Computer Browser service crash-looping ~267x/7d (user disabling via
+      `sc.exe config Browser start= disabled`; needs `sc.exe stop Browser` to take effect
+      now, revert with `start= demand`). Ombi still RUNNING despite the user believing it
+      was uninstalled -- proven by recency (51 events in last 24h, last one 54 min before
+      the run started); likely a leftover Windows SERVICE, which is why it's invisible in
+      the startup audit (that reads Win32_StartupCommand, which does not cover services) --
+      same shape as the ExpressVPN orphaned-driver finding. Its errors are a Sonarr v2 API
+      path (`/api/series`, moved to `/api/v3/series` in Sonarr v3+) and a retired Plex
+      endpoint returning 410 Gone. SFC found and repaired real corruption -- re-run
+      `sfc /scannow` after reboot to confirm clean. Storage WMI provider broken (hypothesis,
+      UNVERIFIED: third-party storage/pooling provider, given the 33/22 TB volumes report as
+      local fixed disks); check `winmgmt /verifyrepository`. Box is Win10 22H2, out of
+      mainstream support since 2025-10-14 -- confirm whether it's on consumer ESU.
+- [x] COMMENT-BASED HELP WAS SILENTLY DEAD (2026-08-04, found incidentally while verifying
+      the new -OptimizeAllDrives param during close-out). `Get-Help .\Invoke-PCTuneup.ps1`
+      returned a bare auto-generated SYNTAX STRING, not help: 0 parameters, 0 examples,
+      no description -- every .PARAMETER/.EXAMPLE in the 90-line help block was invisible,
+      and the README explicitly promises `Get-Help -Full` works. Cause: `#Requires -Version
+      5.1` sat IMMEDIATELY adjacent to the opening `<#`. PowerShell then does not associate
+      the block with the script; one blank line between them fixes it. Verified pre-existing
+      (HEAD had it too), and isolated with a 3-case minimal repro (no-#Requires / adjacent /
+      blank-line-after) rather than guessed. Then hit a SECOND instance of the same class
+      immediately: the explanatory comment written to document the fix contained a literal
+      `#>`, which terminated the help block early and re-broke it -- and also corrupted the
+      bisect that was hunting it. Both traps now recorded in the sanity gate above, which
+      gained a Get-Help assertion, because this failure mode is 100% silent.
+      Now: 13 params, 3 examples, real synopsis, on BOTH 5.1 and pwsh.
+- [x] Test on a Windows 10 machine to confirm cross-version behavior (2026-08-04, above)
+- [x] END-TO-END READ + 4 FIXES (2026-08-19). Full 1466-line pass looking for correctness
+      and reporting defects. Found 6 real issues + minors; user chose to fix 1-4 first,
+      TEST, then add features A/B/C (below).
+      (1) FALSE "CLEAN" ON A FAILED SCAN -- the worst reporting bug found so far. If
+      Find-EventIssues threw, Invoke-Step recorded 'Event analysis Failed', but $script:Issues
+      stayed EMPTY and Get-HealthReport's empty branch then printed "No notable issues
+      classified. Clean." + 'Health analysis OK'. The summary carried two contradictory rows
+      and the REASSURING one was wrong. An empty issue list has two causes -- healthy machine
+      vs dead scan -- and they rendered identically. Fix: $script:EventScanOk, set true ONLY
+      on a completed sweep (incl. the legitimate zero-events early return); the report now
+      says "EVENT SCAN DID NOT COMPLETE -- do NOT read this as clean" and records Failed.
+      (2) REPORT FINDINGS ALL RENDERED AS 'OK'. The summary Status column only answered
+      "did the step execute", never "did it find something". A HIGH-severity impending-disk-
+      failure issue, a 6%-free drive, a DIRTY volume, dead connectivity and a pending reboot
+      were ALL 'OK'; you had to read the Detail column to notice. Added a 'Warn' status
+      (step worked; MACHINE has a problem -- orthogonal to 'Failed' = tool didn't work) plus
+      a second end-of-run tally that reprints every Warn as a checklist. Severity mapping:
+      High always warns; Medium warns only while ACTIVE (Recent24h > 0, since a stale Medium
+      is already tagged "may already be resolved"); Low never warns.
+      (3) winget REPAIR FALLBACK REPORTED FALSE FAILURES. Measured live: `winget repair`
+      -> 0x8A15007C (-1978335108) "installer technology does not support repair", then the
+      `winget upgrade` fallback -> 0x8A15002B (-1978335189) "No available upgrade found".
+      Both non-zero, so a package that simply CANNOT be repaired and is ALREADY CURRENT was
+      reported Failed. That is the COMMON case (a crashing app is usually already newest),
+      not an edge case. New Get-WingetNoOpReason maps both to Skipped naming both reasons;
+      also applied to Update-Apps so "nothing to upgrade" is OK, not Partial. Same
+      false-failure family as DISM 3010 / chkdsk exit 3 / the netsh ACL key.
+      (4) HARDCODED C: while Optimize-Drives already derived $env:SystemDrive -- chkdsk
+      /scan, the /f /r scheduling, chkntfs verification, both manual-fix hints, the restore-
+      point hint and both free-space snapshots. Wrong volume on any box where Windows isn't
+      on C:. Now one $script:SysDriveLetter / $script:SysDrive pair defined at setup and used
+      everywhere; grep for hardcoded C: outside comments returns nothing.
+      Verified: parse OK 5.1, PSSA clean, Get-Help 13 params/3 examples, AST-loaded smoke
+      tests of all 4 fixes under 5.1, plus a regression run of every prior-session fix.
+- [ ] NOT YET FIXED from the same read (deliberately deferred, user sequenced the work):
+      (5) Invoke-Defender writes TWO different step names ('Defender' on skip/fail paths vs
+      'Defender scan' on success) -- inconsistent summary. (6) SFC/DISM outcomes aren't
+      classified: "found corrupt files and successfully repaired them" (which really happened
+      on the Win10 box and drove a post-reboot re-run) is indistinguishable from "no
+      violations found" -- both render 'OK exit 0'. Same shape as the Windows Update
+      count fix. (7) Minors: w32tm pipes its output to Out-Null so a failure gives an exit
+      code and no reason (same class as the chkdsk fix); Repair-Issues interpolates $app.App
+      into a step name without Format-EventToken; temp cleanup only inspects TOP-LEVEL
+      entries, and a directory's mtime updates when its children change, so an active folder
+      shields arbitrarily old contents from the 24h rule (reclaims less than it appears to).
+- [x] FIXES 1-4 VALIDATED IN PRODUCTION (2026-08-19, tuneup-2026-08-19-111404, pwsh 7,
+      -DeepClean -NetworkReset -FlushUpdateCache -ResetStore, 1h05m). 'Warn' fired
+      SELECTIVELY exactly as designed: 'Issue: Service crashes' (Medium, 4 in last 24h =
+      active) and 'Pending reboot' warned, while five Low categories AND the stale Hyper-V
+      category correctly stayed OK; the new tally reprinted both as a checklist. System-drive
+      derivation live ('Optimize C:', 'reclaimed 1.73 GB (C: 66.06->67.79 GB)'). Only WARNING
+      in the whole log was the intentional -NetworkReset notice; no TerminatingError. Prior
+      fixes still holding (service culprits render 'WSearch x24, WMPNetworkSvc x3, HNS x1...'
+      with no '30000'; 'App error logs (.NET)' classified 25 events). CAVEAT: fix 3's winget
+      no-op path was NOT exercised (Issue repair hit 'nothing safely auto-repairable') --
+      it is unit-verified only, still awaiting a production run that actually repairs.
+- [x] FEATURES A + B + C SHIPPED (2026-08-19) as one coherent
+      "what is actually running on this machine, and what's broken" pass.
+      A. STARTUP AUDIT -> FULL AUTOSTART SURFACE. Measured on the Win11 box: Win32_StartupCommand
+         sees 12 entries; it MISSES 22 non-Windows auto-start services and 5 non-Microsoft
+         logon/boot scheduled tasks. Under a third of reality -- and exactly the blind spot
+         that hid Ombi (a service) on the Win10 box and the ExpressVPN drivers before it.
+      B. DEVICE HEALTH via Win32_PnPEntity ConfigManagerErrorCode != 0. NOTE: an
+         orphaned-driver detector was DECLINED earlier as "narrow value, false-positive-prone";
+         this is different and the user agreed to it -- it reads WINDOWS' OWN verdict (the
+         same field Device Manager renders as a yellow bang), not a heuristic. It already
+         proved itself: it found ROOT\NET\0000 "ExpressVPN TUN Driver" and ROOT\NET\0001
+         "ExpressVPN TAP Adapter", both ConfigManagerErrorCode 19 / Status Error, on this box
+         RIGHT NOW -- residue of the June cleanup (services gone, expressvpntun.sys gone, but
+         tapexpressvpn.sys still on disk and both device nodes still registered). Report-only;
+         removal (pnputil /remove-device) would be a separate opt-in to argue on its own.
+      C. STARTUP/AUTOSTART ENTRIES POINTING AT MISSING FILES -- classic partial-uninstall
+         residue, composes with A.
+      AS BUILT: Get-StartupAudit rewritten (step now named 'Autostart audit') over a new
+      Get-AutostartEntries collector; new Get-DeviceHealthReport + Convert-DeviceErrorCode
+      (CM_PROB_* decoded to plain English); new Resolve-CommandPath for C. Live on the Win11
+      box: 39 entries (12 Run/Startup + 22 services + 5 tasks) vs 12 before, 0 broken; device
+      health -> Warn naming both ExpressVPN ghosts. ScheduledTasks is imported EXPLICITLY --
+      it is CDXML, same module-AUTOLOAD trap that once broke the DNS report -- and a failure
+      degrades to "Run keys + services only", never a dead step.
+      TWO DESIGN RULES worth keeping: (1) Resolve-CommandPath returns $null rather than
+      guessing, because a wrong guess becomes a FALSE "this entry is broken" accusation --
+      bare '.lnk' names and rundll32-style commands are reported as unverifiable, not broken.
+      (2) ConfigManagerErrorCode 22 = user DISABLED the device deliberately; it is counted,
+      never warned on, or every intentionally-disabled device becomes a false alarm.
+      BUG CAUGHT IN TESTING: a scheduled task's .Execute is sometimes ALREADY quoted, so
+      concatenating it raw produced '""C:\path\x.exe" args' -- the first quote pair enclosed
+      nothing, Resolve-CommandPath found an empty path and SILENTLY SKIPPED the existence
+      check (RtkAudUService64_BG). Fixed by stripping quotes before rebuilding the command.
+      Verified: parse OK 5.1, PSSA clean, Get-Help 13 params, live run of both reports under
+      5.1, plus a NEGATIVE test (shadowed collector with fabricated dead entries across all
+      three surfaces) proving detection + the Warn row, with a good entry and an unverifiable
+      .lnk correctly excluded.
+      Investigated and REJECTED with evidence: boot-performance analysis
+      (Diagnostics-Performance/Operational id 100/101/102/103) would name the exact slow
+      app/driver/service at boot and would have caught the WSearch startup race -- but that
+      log returned 0 events on this box (disabled on many systems), so it is conditional
+      value only. SMART via MSStorageDriver_FailurePredictStatus returned nothing -- it is an
+      ATA/SATA-era WMI class that NVMe drives don't populate, so it would be dead code on
+      most modern hardware.
+- [ ] Optional: add to command-center projects-index
+- [ ] Optional: scheduled-task wrapper for monthly auto-run
