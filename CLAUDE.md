@@ -70,8 +70,16 @@ Origin research (the verified command spec this script implements) lives in
   stub. Watch for stub params colliding with common parameters like `-ErrorAction`.
 - **Keep `CLAUDE.md` under ~25 KB.** When work completes, move the entry into
   `docs/build-log.md` rather than leaving it here. This file reached 37 KB once
-  because finished milestones never moved out; Claude Code warns above ~40 KB and
-  every byte is loaded at the start of every session.
+  because finished milestones never moved out, and every byte is loaded at the
+  start of every session.
+  *(Corrected 2026-08-27 — this used to claim "Claude Code warns above ~40 KB"
+  as a fixed limit. Verified against the v2.1.238 binary: the warning fires per
+  file at `max(40,000 chars, context_window x 0.05 x chars_per_token)`, so it is
+  40,000 chars only on a 200K-context model and ~150-200K chars on a 1M one.
+  **Nothing is ever truncated** — the only hard limit skips a file whole at 4 MB.
+  So ~25 KB here is an editorial rule about keeping the file readable and its
+  instructions undiluted, NOT a technical ceiling. Full reasoning:
+  `command-center/decisions/2026-08-27-claude-md-size-limits.md`.)*
 
 ## Constraints & Rules
 - **Cross-version first.** Anything added must work on Win10 1809+ AND Win11. If a
